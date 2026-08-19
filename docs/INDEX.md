@@ -1,14 +1,14 @@
 # Índice de Documentación - Trading Automático de Opciones
 
 **Documentación generada:** Agosto 2026  
-**Total:** 2,767 líneas | ~80 KB  
+**Total:** 2,648 líneas en documentación | ~80 KB  
 **Lenguaje:** Rust + Tokio (persistencia en memoria + journal por defecto)
 
 ---
 
 ## 📑 Tabla de Contenidos
 
-### 1. **README.md** (313 líneas) ⭐ COMIENZA AQUÍ
+### 1. [**README.md** (304 líneas)](../README.md) ⭐ COMIENZA AQUÍ
 **Punto de entrada general**
 
 **Secciones:**
@@ -29,7 +29,7 @@
 
 ---
 
-### 2. **EXECUTIVE_SUMMARY.md** (376 líneas) 📊 PARA LÍDERES
+### 2. [**EXECUTIVE_SUMMARY.md** (346 líneas)](EXECUTIVE_SUMMARY.md) 📊 PARA LÍDERES
 **Resumen ejecutivo con decisiones y KPIs**
 
 **Secciones:**
@@ -54,7 +54,7 @@
 
 ---
 
-### 3. **ARCHITECTURE.md** (634 líneas) 🏗️ DISEÑO TÉCNICO COMPLETO
+### 3. [**ARCHITECTURE.md** (578 líneas)](ARCHITECTURE.md) 🏗️ DISEÑO TÉCNICO COMPLETO
 **Documento técnico principal - Arquitectura general**
 
 **Secciones:**
@@ -93,7 +93,7 @@
   
 - **3.3.6 Módulo Persistencia**
   - Estrategia de almacenamiento
-  - Pool de conexiones
+  - Cache TTL y validación de datos
 
 #### 3.4 Flujos de Negocio
 - Detección de tendencia y ejecución
@@ -141,7 +141,7 @@
 
 ---
 
-### 4. **IMPLEMENTATION_DETAILS.md** (715 líneas) 🔧 ESPECIFICACIÓN GRANULAR
+### 4. [**IMPLEMENTATION_DETAILS.md** (593 líneas)](IMPLEMENTATION_DETAILS.md) 🔧 ESPECIFICACIÓN GRANULAR
 **Detalles técnicos de implementación - Para Developers**
 
 **Secciones:**
@@ -203,7 +203,7 @@
 
 ---
 
-### 5. **DEPLOYMENT.md** (729 líneas) 🚀 GUÍA OPERACIONAL
+### 5. [**DEPLOYMENT.md** (680 líneas)](DEPLOYMENT.md) 🚀 GUÍA OPERACIONAL
 **Instalación, configuración y operación en producción**
 
 **Secciones:**
@@ -241,7 +241,7 @@
 
 #### 5.6 Monitoreo en Producción
 - Análisis de logs
-- Métricas diarias (queries SQL)
+- Métricas diarias desde journal JSONL
 - Alertas recomendadas (scripts)
 
 #### 5.7 Mantenimiento
@@ -365,7 +365,7 @@
 
 | Métrica | Valor |
 |---------|-------|
-| Total de líneas | 2,767 |
+| Total de líneas | 2,648 |
 | Total de secciones | 50+ |
 | Diagramas ASCII/Mermaid | 20+ |
 | Pseudocódigo/Ejemplos | 30+ |
@@ -397,7 +397,7 @@
 
 ### Para Operación
 1. Revisar DEPLOYMENT.md sección 5.6 (Monitoreo)
-2. Usar queries SQL para métricas
+2. Usar `jq` sobre el journal JSONL para métricas
 3. Consultar sección 5.8 (Troubleshooting)
 
 ### Para Testing

@@ -4,7 +4,7 @@
 
 ## 📋 Documentos de Arquitectura
 
-### 1. **ARCHITECTURE.md** - Visión General (634 líneas)
+### 1. [**docs/ARCHITECTURE.md** - Visión General (578 líneas)](docs/ARCHITECTURE.md)
 Documento técnico principal que cubre:
 - ✅ Arquitectura general del sistema
 - ✅ Componentes principales y sus responsabilidades
@@ -21,7 +21,7 @@ Documento técnico principal que cubre:
 
 ---
 
-### 2. **IMPLEMENTATION_DETAILS.md** - Detalles Técnicos (715 líneas)
+### 2. [**docs/IMPLEMENTATION_DETAILS.md** - Detalles Técnicos (593 líneas)](docs/IMPLEMENTATION_DETAILS.md)
 Especificación granular de implementación:
 - ✅ Configuración y validación en startup
 - ✅ Autenticación OAuth 2.0 con IOL
@@ -29,7 +29,7 @@ Especificación granular de implementación:
 - ✅ Algoritmo de detección de tendencia (SMA, R², volatilidad)
 - ✅ Máquina de estados del trading (transiciones, condiciones)
 - ✅ Gestión de órdenes (compra, venta, validación)
-- ✅ Schema SQL completo (4 tablas principales)
+- ✅ Persistencia JSONL y snapshots JSON atómicos sin base de datos por defecto
 - ✅ Recuperación ante fallos (snapshots, journal)
 - ✅ Manejo de errores y resiliencia
 - ✅ Optimizaciones de performance
@@ -39,10 +39,10 @@ Especificación granular de implementación:
 
 ---
 
-### 3. **DEPLOYMENT.md** - Operación y Producción (550+ líneas)
+### 3. [**docs/DEPLOYMENT.md** - Operación y Producción (680 líneas)](docs/DEPLOYMENT.md)
 Guía práctica de deployment y monitoreo:
 - ✅ Preparación de ambiente
-- ✅ Inicialización de base de datos
+- ✅ Inicialización de journal y snapshots
 - ✅ Validación pre-lanzamiento (checklist)
 - ✅ Ejecución local (debug y release)
 - ✅ Deployment en servidor Linux (systemd)
@@ -117,6 +117,10 @@ flowchart LR
 
 ## 🚀 Quick Start
 
+### Estado actual de la implementacion
+
+El nucleo ejecutable ya incluye configuracion validada, detector de tendencias con SMA, volatilidad y R2, maquina de estados, calculo de P&L, mercado simulado y journal JSONL. El unico modo disponible es `fake`; `MODE=live` falla de forma explicita hasta implementar y probar el cliente IOL.
+
 ### 1. Instalación
 ```bash
 git clone <repo-url>
@@ -133,7 +137,7 @@ No se requiere inicializar una base de datos. El sistema mantiene el estado y el
 # Modo por defecto (fake/simulación)
 RUST_LOG=info cargo run
 
-# Para ejecutar órdenes reales (requiere credenciales y responsabilidad)
+# El modo live aun no esta implementado y no envia ordenes reales
 MODE=live RUST_LOG=info cargo run
 ```
 
@@ -176,18 +180,15 @@ sudo systemctl start trading-bot
 ```
 proyecto-options-trading/
 ├── src/
-│   ├── main.rs                 # Punto de entrada
-│   ├── config/                 # Configuración
-│   ├── market/                 # Datos de mercado
-│   │   ├── iol_client.rs       # Cliente IOL
-│   │   ├── price_stream.rs     # Buffer de precios
-│   │   └── cache.rs            # Caché
-│   ├── pattern/                # Detector de tendencias
-│   ├── trading/                # Motor de trading
-│   ├── portfolio/              # Seguimiento de posiciones
-│   ├── persistence/            # Persistencia (in-memory + journal)
-│   └── utils/                  # Utilidades
-├── tests/                      # Tests
+│   ├── main.rs                 # CLI de simulacion
+│   ├── lib.rs                  # API publica del dominio
+│   ├── config.rs               # Configuracion y validacion
+│   ├── market.rs               # Cotizaciones, cache y price stream
+│   ├── broker.rs               # Contrato de broker y FakeBroker
+│   ├── pattern.rs              # Detector de tendencias
+│   ├── trading.rs              # Motor de trading y P&L
+│   ├── portfolio.rs            # Seguimiento de posiciones
+│   └── persistence.rs          # Journal y snapshots
 ├── docs/
 │   ├── ARCHITECTURE.md         # Este documento
 │   ├── IMPLEMENTATION_DETAILS.md
@@ -242,9 +243,8 @@ tail -f logs/trading-bot.log
 ```bash
 # Usando el journal (concatenando JSONL) y jq para agregados diarios
 cat ./data/journal/*.jsonl | jq -s '
-  map(.timestamp = (.timestamp // "") | .date = (.timestamp | split("T")[0]))
-  | group_by(.date)
-  | map({date: .[0].date, operaciones: length, ganancia_neta: (map(.pnl_net // 0) | add)})'
+  group_by(.action)
+  | map({accion: .[0].action, operaciones: length})'
 ```
 
 ---
@@ -264,11 +264,12 @@ cat ./data/journal/*.jsonl | jq -s '
 
 ## 📚 Documentos Relacionados
 
-1. **ARCHITECTURE.md** - Diseño detallado y decisiones
-2. **IMPLEMENTATION_DETAILS.md** - Especificación técnica granular
-3. **DEPLOYMENT.md** - Guía de instalación y operación
-4. **Code:** Comentarios en el código fuente
-5. **Tests:** Casos de prueba como documentación ejecutable
+1. [**docs/ARCHITECTURE.md** - Diseño detallado y decisiones](docs/ARCHITECTURE.md)
+2. [**docs/IMPLEMENTATION_DETAILS.md** - Especificación técnica granular](docs/IMPLEMENTATION_DETAILS.md)
+3. [**docs/DEPLOYMENT.md** - Guía de instalación y operación](docs/DEPLOYMENT.md)
+4. [**docs/INDEX.md** - Índice de documentación](docs/INDEX.md)
+5. **Code:** Código fuente en `src/`
+6. **Tests:** Casos unitarios como documentación ejecutable
 
 ---
 

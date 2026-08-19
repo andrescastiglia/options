@@ -5,11 +5,11 @@
 Este repositorio define un sistema automatico de trading de opciones para Invertir Online (IOL), escrito en Rust. La documentacion de referencia esta en:
 
 - `README.md`: entrada rapida, alcance y comandos basicos.
-- `ARCHITECTURE.md`: componentes, flujos, decisiones y requisitos no funcionales.
-- `IMPLEMENTATION_DETAILS.md`: algoritmos, contratos tecnicos, resiliencia y testing.
-- `DEPLOYMENT.md`: configuracion, operacion, deployment y troubleshooting.
-- `EXECUTIVE_SUMMARY.md`: decisiones de alto nivel, KPIs, riesgos y roadmap.
-- `INDEX.md`: indice y referencias cruzadas.
+- `docs/ARCHITECTURE.md`: componentes, flujos, decisiones y requisitos no funcionales.
+- `docs/IMPLEMENTATION_DETAILS.md`: algoritmos, contratos tecnicos, resiliencia y testing.
+- `docs/DEPLOYMENT.md`: configuracion, operacion, deployment y troubleshooting.
+- `docs/EXECUTIVE_SUMMARY.md`: decisiones de alto nivel, KPIs, riesgos y roadmap.
+- `docs/INDEX.md`: indice y referencias cruzadas.
 
 Antes de cambiar una decision arquitectonica, revisar estas fuentes y mantenerlas sincronizadas cuando corresponda.
 
@@ -96,7 +96,7 @@ Antes de cambiar una decision arquitectonica, revisar estas fuentes y mantenerla
 - Exponer o conservar metricas para uptime, latencia, tasa de ejecucion, P&L, memoria, CPU y tamano del journal.
 - Implementar graceful shutdown: detener nuevas entradas, resolver o marcar posiciones activas, guardar snapshot y hacer flush del journal.
 - Mantener retry exponencial, circuit breaker y health checks sin bloquear el runtime asincrono.
-- Cualquier cambio de deployment debe seguir `DEPLOYMENT.md` y preservar permisos restrictivos de `.env` y `data/`.
+- Cualquier cambio de deployment debe seguir `docs/DEPLOYMENT.md` y preservar permisos restrictivos de `.env` y `data/`.
 
 ## Testing y validacion
 
@@ -109,7 +109,7 @@ Antes de considerar terminado un cambio:
 5. Cubrir errores de red, rate limit, refresh, ordenes rechazadas, timeouts, datos invalidos, replay de journal y recuperacion de snapshots.
 6. Verificar que el modo fake sigue sin ejecutar compras o ventas reales.
 
-Cuando el repositorio aun no tenga `Cargo.toml` o `src/`, tratar los documentos como especificacion y no inventar resultados de compilacion o tests. Mantener la documentacion alineada con la implementacion real y actualizar `INDEX.md` si cambian las secciones o referencias.
+Cuando el repositorio aun no tenga `Cargo.toml` o `src/`, tratar los documentos como especificacion y no inventar resultados de compilacion o tests. Mantener la documentacion alineada con la implementacion real y actualizar `docs/INDEX.md` si cambian las secciones o referencias.
 
 ## Alcance y criterio de cambios
 

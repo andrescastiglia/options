@@ -1,7 +1,12 @@
 # Detalles de Implementación - Trading de Opciones Rust
 
-Notas de diseño rápidas:
-- UI: ratatui para una TUI limpia que muestre todos los indicadores clave (precio, SMA, volatilidad, P&L hipotético, posición activa, tiempo en posición, umbrales).
+Estado de implementacion:
+- El nucleo CLI y de dominio ya esta implementado en `src/`.
+- La UI ratatui queda planificada; actualmente los indicadores se emiten con `tracing`.
+- El cliente live de IOL queda bloqueado hasta contar con un contrato HTTP probado.
+
+Notas de diseño:
+- UI prevista: ratatui para una TUI limpia que muestre todos los indicadores clave (precio, SMA, volatilidad, P&L hipotético, posición activa, tiempo en posición, umbrales).
 - Logs: salida simple y profesional (tracing, niveles info/warn/error).
 - Trace: journal append-only para auditoría y replay.
 - Persistencia: sin base de datos por defecto — estado en memoria y snapshots opcionales.

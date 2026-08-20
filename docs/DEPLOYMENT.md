@@ -67,6 +67,8 @@ MAX_CONCURRENT_REQUESTS=10
 CACHE_TTL_SECS=60
 MAX_POSITION_SIZE=5
 POSITION_TIMEOUT_MINS=60
+MAX_MARKET_DATA_AGE_SECS=15
+MAX_OPTION_SPREAD_PERCENTAGE=20
 
 # === PERSISTENCIA ===
 # Por defecto se usa in-memory + journal/snapshots. Si se desea un backend externo, habilitar DATABASE_URL.
@@ -79,25 +81,24 @@ POSITION_TIMEOUT_MINS=60
 
 No es necesario inicializar una base de datos. Por defecto el bot mantiene el estado en memoria y ofrece dos mecanismos opcionales para durabilidad y auditoría:
 
-1) Journal append-only (archivo JSONL): cada operación escribe una entrada que puede reprocesarse (replay).
-2) Snapshots periódicos (JSON.gz): serializar el estado completo cada N minutos.
+1) Journal append-only (`DATA_DIR/<modo>/journal.jsonl`): cada evento operativo se escribe tipado y secuenciado.
+2) Snapshot (`DATA_DIR/<modo>/state.json`): estado completo escrito mediante archivo temporal y rename atómico.
 
 ### 2.1 Preparar directorio de snapshots/journal
 
 ```bash
 # Crear directorios
-mkdir -p ./data/snapshots
-mkdir -p ./data/journal
-chmod 700 ./data/snapshots ./data/journal
+mkdir -p ./data/replay ./data/paper ./data/live
+chmod 700 ./data/replay ./data/paper ./data/live
 ```
 
 ### 2.2 Verificación rápida
 
 ```bash
 # Verificar que la app puede escribir snapshots (simulación)
-touch ./data/journal/test-entry.jsonl
-gzip -c /dev/null > ./data/snapshots/test-snapshot.json.gz || true
-ls -la ./data/snapshots ./data/journal
+TUI_ENABLED=false DATA_DIR=./data cargo run
+test -s ./data/replay/journal.jsonl
+test -s ./data/replay/state.json
 ```
 
 # Opcional: Si se desea usar SQLite/Postgres/otro backend, habilitar con la variable DATABASE_URL y proveer el script SQL correspondiente (no usado por defecto).
@@ -677,4 +678,3 @@ cat ./data/journal/*.jsonl | jq -s '
 ---
 
 **Guía de Deployment v1.0**
-

@@ -1,14 +1,13 @@
 # Índice de Documentación - Trading Automático de Opciones
 
 **Documentación generada:** Agosto 2026  
-**Total:** 2,648 líneas en documentación | ~80 KB  
 **Lenguaje:** Rust + Tokio (persistencia en memoria + journal por defecto)
 
 ---
 
 ## 📑 Tabla de Contenidos
 
-### 1. [**README.md** (304 líneas)](../README.md) ⭐ COMIENZA AQUÍ
+### 1. [**README.md**](../README.md) ⭐ COMIENZA AQUÍ
 **Punto de entrada general**
 
 **Secciones:**
@@ -176,7 +175,7 @@
 - operations: Vec/structs en memoria
 - positions: DashMap/HashMap
 - journal: JSONL append-only (./data/journal)
-- snapshots: JSON.gz periódicos (./data/snapshots)
+- snapshots: JSON atómico por modo (`./data/<modo>/state.json`)
 
 #### 4.8 Recuperación ante Fallos
 - Snapshots del estado
@@ -448,4 +447,3 @@
 **Documentación completada:** Agosto 2026  
 **Mantenida por:** Equipo de Arquitectura  
 **Próxima revisión:** Diciembre 2026
-

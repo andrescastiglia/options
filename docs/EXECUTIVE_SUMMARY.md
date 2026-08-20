@@ -121,14 +121,14 @@ Ganancia_Neta = Ganancia_Bruta - Comisión - Impuesto
 ### Criterio de Venta Automático
 
 ```plaintext
-Threshold = (Comisión + Impuesto) × MIN_PROFIT_MULTIPLIER
+Threshold = Comisión × MIN_PROFIT_MULTIPLIER
 
 Ejemplo con MIN_PROFIT_MULTIPLIER = 2.0:
-  - Comisión + Impuesto = $100
-  - Threshold = $200
+  - Comisión total de compra y venta = $100
+  - Threshold neto = $200
   - Se vende cuando Ganancia_Neta >= $200
   
-Beneficio: IOL gana $100, tú ganas $200 = Win-win
+El impuesto ya se descuenta al calcular Ganancia_Neta; no se vuelve a incluir en el threshold.
 ```
 
 ---
@@ -169,14 +169,14 @@ Beneficio: IOL gana $100, tú ganas $200 = Win-win
 
 ## 📊 Performance Targets
 
-| Métrica | Target | Actual | Status |
-|---------|--------|--------|--------|
-| Latencia compra-venta | < 2 seg | ~1.5 seg | ✓ |
-| Detección tendencia | < 1 seg | ~0.3 seg | ✓ |
-| Procesamiento precio | < 100ms | ~20ms | ✓ |
-| Uso memoria | < 500 MB | ~50 MB | ✓ |
-| CPU promedio | < 30% | ~5% | ✓ |
-| Uptime | 99.9% | ~99.95% | ✓ |
+| Métrica | Target | Medición actual | Status |
+|---------|--------|-----------------|--------|
+| Latencia compra-venta | < 2 seg | No medida contra IOL | Pendiente |
+| Detección tendencia | < 1 seg | Tests funcionales, sin benchmark | Pendiente |
+| Procesamiento precio | < 100ms | Sin benchmark formal | Pendiente |
+| Uso memoria | < 500 MB | Sin medición prolongada | Pendiente |
+| CPU promedio | < 30% | Sin medición prolongada | Pendiente |
+| Uptime | 99.9% | Sin despliegue productivo | Pendiente |
 
 ---
 
@@ -336,11 +336,10 @@ Sistema robusto y performante para trading automático de opciones, diseñado co
 ✅ **Seguridad:** Credenciales protegidas, sin hardcoding  
 ✅ **Escalabilidad:** Preparado para expansión futura  
 
-**Listo para deployment en producción después de validación en paper trading.**
+**Replay y paper están listos para validación. Producción live requiere paper trading prolongado, contrato IOL verificado, reconciliación de órdenes y alertas externas.**
 
 ---
 
 **Documento preparado:** Agosto 2026  
 **Revisado por:** Arquitecto de Sistemas  
 **Siguiente revisión:** Diciembre 2026
-

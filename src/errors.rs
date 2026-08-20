@@ -12,4 +12,8 @@ pub enum AppError {
     Persistence(#[from] io::Error),
     #[error("serializacion fallida: {0}")]
     Serialization(#[from] serde_json::Error),
+    #[error("recuperacion fallida: {0}")]
+    Recovery(String),
+    #[error("integracion externa fallida: {0}")]
+    External(String),
 }

@@ -1,19 +1,21 @@
 use std::collections::VecDeque;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Direction {
     Up,
     Down,
     Neutral,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct PriceSample {
     pub price: f64,
     pub timestamp_secs: i64,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Trend {
     pub direction: Direction,
     pub confirmed: bool,
@@ -24,6 +26,7 @@ pub struct Trend {
     pub r_squared: Option<f64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TrendDetector {
     samples: VecDeque<PriceSample>,
     capacity: usize,
@@ -58,28 +61,34 @@ impl TrendDetector {
             self.samples.pop_front();
         }
         self.samples.push_back(sample);
-        Some(self.detect())
-    }
-
-    pub fn detect(&mut self) -> Trend {
-        let values: Vec<f64> = self.samples.iter().map(|sample| sample.price).collect();
-        let sma = values.iter().sum::<f64>() / values.len() as f64;
-        let current = *values.last().unwrap_or(&0.0);
-        let direction = if current > sma * 1.001 {
-            Direction::Up
-        } else if current < sma * 0.999 {
-            Direction::Down
-        } else {
-            Direction::Neutral
-        };
+        let direction = direction_for(&self.samples);
         if direction == Direction::Neutral {
             self.confirmation_count = 0;
+            self.last_direction = Direction::Neutral;
         } else if direction == self.last_direction {
             self.confirmation_count += 1;
         } else {
             self.last_direction = direction;
             self.confirmation_count = 1;
         }
+        Some(self.detect())
+    }
+
+    pub fn detect(&self) -> Trend {
+        let values: Vec<f64> = self.samples.iter().map(|sample| sample.price).collect();
+        if values.is_empty() {
+            return Trend {
+                direction: Direction::Neutral,
+                confirmed: false,
+                samples: 0,
+                sma: 0.0,
+                slope: 0.0,
+                volatility: 0.0,
+                r_squared: None,
+            };
+        }
+        let sma = values.iter().sum::<f64>() / values.len() as f64;
+        let direction = direction_for(&self.samples);
         let slope = linear_slope(&values);
         let volatility = (values
             .iter()
@@ -103,19 +112,34 @@ impl TrendDetector {
         if self.samples.len() < required {
             return false;
         }
-        let recent: Vec<f64> = self
+        let mut recent: Vec<f64> = self
             .samples
             .iter()
             .rev()
             .take(required)
             .map(|sample| sample.price)
             .collect();
-        let sma = recent.iter().sum::<f64>() / recent.len() as f64;
+        recent.reverse();
         match position_direction {
-            Direction::Up => recent.iter().all(|price| *price < sma),
-            Direction::Down => recent.iter().all(|price| *price > sma),
+            Direction::Up => recent.windows(2).all(|pair| pair[1] < pair[0]),
+            Direction::Down => recent.windows(2).all(|pair| pair[1] > pair[0]),
             Direction::Neutral => false,
         }
+    }
+}
+
+fn direction_for(samples: &VecDeque<PriceSample>) -> Direction {
+    if samples.is_empty() {
+        return Direction::Neutral;
+    }
+    let sma = samples.iter().map(|sample| sample.price).sum::<f64>() / samples.len() as f64;
+    let current = samples.back().map_or(0.0, |sample| sample.price);
+    if current > sma * 1.001 {
+        Direction::Up
+    } else if current < sma * 0.999 {
+        Direction::Down
+    } else {
+        Direction::Neutral
     }
 }
 
@@ -172,10 +196,12 @@ mod tests {
     #[test]
     fn confirms_uptrend_after_consecutive_samples() {
         let mut detector = TrendDetector::new(10, 3);
-        for (timestamp, price) in [100.0, 101.0, 102.0, 103.0].into_iter().enumerate() {
-            detector.push(sample(price, timestamp as i64));
-        }
-        let trend = detector.detect();
+        let trend = [100.0, 101.0, 102.0, 103.0]
+            .into_iter()
+            .enumerate()
+            .filter_map(|(timestamp, price)| detector.push(sample(price, timestamp as i64)))
+            .last()
+            .unwrap();
         assert_eq!(trend.direction, Direction::Up);
         assert!(trend.confirmed);
         assert!(trend.slope > 0.0);
@@ -187,5 +213,18 @@ mod tests {
         assert!(detector.push(sample(0.0, 1)).is_none());
         assert!(detector.push(sample(100.0, 2)).is_some());
         assert!(detector.push(sample(101.0, 1)).is_none());
+    }
+
+    #[test]
+    fn confirms_reversal_from_monotonic_opposite_samples() {
+        let mut detector = TrendDetector::new(10, 2);
+        for (timestamp, price) in [100.0, 101.0, 102.0, 101.5, 101.0, 100.5]
+            .into_iter()
+            .enumerate()
+        {
+            detector.push(sample(price, timestamp as i64));
+        }
+        assert!(detector.opposite_confirmed(Direction::Up, 3));
+        assert!(!detector.opposite_confirmed(Direction::Down, 3));
     }
 }

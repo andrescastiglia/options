@@ -2,7 +2,11 @@ name: Request Copilot Review
 
 on:
   pull_request_target:
-    types: [opened, ready_for_review, reopened]
+    types: [opened, ready_for_review, reopened, synchronize]
+
+concurrency:
+  group: copilot-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 
 permissions:
   pull-requests: write
@@ -16,4 +20,4 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           PR_URL: ${{ github.event.pull_request.html_url }}
-        run: gh pr edit "$PR_URL" --add-reviewer "copilot-pull-request-reviewer[bot]"
+        run: gh pr edit "$PR_URL" --add-reviewer @copilot

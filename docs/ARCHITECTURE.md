@@ -66,18 +66,20 @@ TREND_CHANGE_SAMPLES=3             # Muestras para confirmar cambio de tendencia
 
 # Parámetros económicos
 COMMISSION_PERCENTAGE=0.19         # Comisión en porcentaje (default 0.19% IOL)
-TAX_PERCENTAGE=0.35                # Impuesto sobre ganancias (default 35% Argentina)
-MIN_PROFIT_MULTIPLIER=2.0          # Ganancia mínima = (Comisión + Impuestos) * este factor
+TAX_PERCENTAGE=35                  # Impuesto sobre ganancias (default 35% Argentina)
+MIN_PROFIT_MULTIPLIER=2.0          # Ganancia neta mínima = Comisión total * este factor
 
 # Parámetros técnicos
 LOG_LEVEL=info                     # debug, info, warn, error
 MAX_CONCURRENT_REQUESTS=10         # Conexiones simultáneas a IOL
 CACHE_TTL_SECS=60                  # TTL de caché de datos
+MAX_MARKET_DATA_AGE_SECS=15        # Antigüedad máxima para operar
 
 # Parámetros de opciones
 OPTION_EXPIRY_DAYS=1              # Preferencia de vencimiento (1=hoy, 7=1 semana)
 MAX_POSITION_SIZE=5               # Máximo número de contratos por posición
 POSITION_TIMEOUT_MINS=60          # Tiempo máximo de espera para cierre de posición
+MAX_OPTION_SPREAD_PERCENTAGE=20   # Spread máximo sobre precio medio para comprar
 ```
 
 **Estructura de datos:**
@@ -186,14 +188,14 @@ flowchart TD
 ```plaintext
 Ganancia Bruta = (Precio Venta - Precio Compra) × Contratos
 
-Comisión Total = Ganancia Bruta × (COMMISSION_PERCENTAGE / 100)
-                + Ganancia Bruta × (COMMISSION_PERCENTAGE / 100)  [Compra y Venta]
+Comisión Total = Valor Compra × (COMMISSION_PERCENTAGE / 100)
+                + Valor Venta × (COMMISSION_PERCENTAGE / 100)
 
 Impuesto = Ganancia Bruta × (TAX_PERCENTAGE / 100)
 
 Ganancia Neta = Ganancia Bruta - Comisión Total - Impuesto
 
-Condición de Salida = Ganancia Neta >= (Comisión Total + Impuesto) × MIN_PROFIT_MULTIPLIER
+Condición de Salida = Ganancia Neta >= Comisión Total × MIN_PROFIT_MULTIPLIER
 ```
 
 ---
@@ -223,7 +225,7 @@ Condición de Salida = Ganancia Neta >= (Comisión Total + Impuesto) × MIN_PROF
 **Estrategia (sin DB por defecto):**
 
 - Almacenamiento principal: estructuras en memoria (DashMap/Mutex + vectores) para acceso rápido y concurrencia segura.
-- Persistencia opcional: snapshots periódicos (JSON.gz) y journal append-only para auditoría y replay.
+- Persistencia opcional: snapshots periódicos JSON atómicos y journal append-only para auditoría y replay.
 - Consistencia: operaciones críticas actualizan el estado en memoria y escriben una entrada de journal atomically.
 - Recuperación: al startup, cargar snapshot más reciente y reprocesar journal para alcanzar estado actual.
 
@@ -442,34 +444,36 @@ zeroize = "1"  # Para seguridad de credenciales
 - [x] Tests unitarios básicos
 
 ### Fase 2: Datos de Mercado (Semana 2-3)
-- [ ] Price stream manager
-- [ ] Buffer histórico con ventana deslizante
-- [ ] Caché en memoria
-- [ ] Tests de obtención de precios
+- [x] Price stream manager y frames subyacente/cadena de opciones
+- [x] Buffer histórico con ventana deslizante
+- [x] Caché en memoria
+- [x] Tests de validación, selección y parsing de precios
 
 ### Fase 3: Lógica de Trading (Semana 3-4)
-- [ ] Detector de patrones (tendencia)
-- [ ] Máquina de estados
-- [ ] Position manager
-- [ ] Tests de lógica de compra/venta
+- [x] Detector de patrones (tendencia y reversión monotónica)
+- [x] Máquina de estados
+- [x] Position manager, P&L contractual y límites de riesgo
+- [x] Tests de lógica de compra/venta y replay E2E
 
 ### Fase 4: Persistencia (Semana 4-5)
-- [ ] Implementar almacenamiento en memoria y journal
-- [ ] Snapshots periódicos y carga inicial desde snapshot
-- [ ] Tests de recuperación mediante snapshot + replay de journal
-- [ ] Validación de consistencia y stress tests
+- [x] Almacenamiento en memoria y journal tipado/secuenciado
+- [x] Snapshots completos y carga inicial desde snapshot
+- [x] Replay del journal posterior al snapshot
+- [x] Validación de consistencia y aislamiento de datos en tests
 
 ### Fase 5: Integración y Polish (Semana 5-6)
-- [ ] Integración end-to-end
-- [ ] Manejo de errores robusto
-- [ ] Logging completo
-- [ ] Tests de integración
+- [x] Integración end-to-end en replay/paper
+- [x] Manejo de errores, órdenes no resueltas y kill switch
+- [x] Logging estructurado, métricas y TUI
+- [x] Tests de contratos y ciclo completo simulado
 
 ### Fase 6: Deployment y Monitoreo (Semana 6)
 - [ ] Dockerización
 - [ ] Scripts de deployment
-- [ ] Alertas y monitoreo
-- [ ] Documentación de operaciones
+- [x] Monitoreo local mediante TUI y tracing
+- [x] Documentación de operación local y gates live
+
+Estado de producción: `replay` y `paper` están implementados. `live` dispone del adaptador HTTP, exige confirmación explícita y una ruta de órdenes verificada por el operador; respuestas pendientes o parciales detienen el motor. El arranque reconcilia cartera y órdenes pendientes de IOL con el estado local. Antes de operar capital real aún se requieren validación prolongada en paper y alertas externas con confirmación del operador.
 
 ---
 
@@ -568,11 +572,10 @@ Impuesto = Ganancia Bruta × 35%
 
 Ganancia Neta = Ganancia Bruta - Comisión - Impuesto
 
-Threshold de Venta = (Comisión + Impuesto) × MIN_PROFIT_MULTIPLIER
+Threshold de Venta = Comisión × MIN_PROFIT_MULTIPLIER
 ```
 
 ---
 
 **Documento generado:** 2026-08-19  
 **Siguiente revisión:** 2026-09-19
-

@@ -1,301 +1,147 @@
-# Trading Automático de Opciones - IOL
+# Options Trading para IOL
 
-**Sistema automático de trading de opciones en Invertir Online, desarrollado en Rust.**
+Motor de trading de opciones en Rust con replay determinístico, paper trading sobre datos de IOL, controles de riesgo, journal recuperable y una TUI de monitoreo.
 
-## 📋 Documentos de Arquitectura
+El modo predeterminado es `replay`: nunca envía órdenes reales. `paper` consume mercado de IOL pero ejecuta órdenes en el broker simulado. `live` requiere activación explícita y un contrato de órdenes configurado por el operador.
 
-### 1. [**docs/ARCHITECTURE.md** - Visión General (578 líneas)](docs/ARCHITECTURE.md)
-Documento técnico principal que cubre:
-- ✅ Arquitectura general del sistema
-- ✅ Componentes principales y sus responsabilidades
-- ✅ Flujos de negocio (detección de tendencia, ejecución, cierre)
-- ✅ Requisitos no funcionales (performance, estabilidad, confiabilidad)
-- ✅ Seguridad y manejo de credenciales
-- ✅ Estructura de directorios propuesta
-- ✅ Dependencias principales
-- ✅ Decisiones arquitectónicas justificadas
-- ✅ Plano de implementación por fases
-- ✅ Estrategia de testing
+> No es asesoramiento financiero. La estrategia incluida es simple y sirve para validar la plataforma; su rentabilidad no está demostrada.
 
-**Público:** Arquitectos, Senior Developers, Tech Leads
+## Flujo del producto
 
----
+1. Obtiene el precio del subyacente y su cadena de opciones.
+2. Calcula SMA, pendiente, volatilidad, R² y confirmación consecutiva.
+3. Una suba confirmada busca una CALL; una baja confirmada busca una PUT.
+4. Selecciona una opción líquida por vencimiento y cercanía del strike.
+5. Calcula la cantidad que entra en el presupuesto de compra, incluida la comisión.
+6. Valida pérdidas y cantidad diaria de operaciones.
+7. Envía una orden limitada idempotente al broker paper o live.
+8. Cierra por objetivo neto, stop-loss, reversión, timeout o cierre manual.
+9. Registra eventos tipados y snapshots atómicos para recuperación.
 
-### 2. [**docs/IMPLEMENTATION_DETAILS.md** - Detalles Técnicos (593 líneas)](docs/IMPLEMENTATION_DETAILS.md)
-Especificación granular de implementación:
-- ✅ Configuración y validación en startup
-- ✅ Autenticación OAuth 2.0 con IOL
-- ✅ Gestión de datos de precio (buffer, caché, validación)
-- ✅ Algoritmo de detección de tendencia (SMA, R², volatilidad)
-- ✅ Máquina de estados del trading (transiciones, condiciones)
-- ✅ Gestión de órdenes (compra, venta, validación)
-- ✅ Persistencia JSONL y snapshots JSON atómicos sin base de datos por defecto
-- ✅ Recuperación ante fallos (snapshots, journal)
-- ✅ Manejo de errores y resiliencia
-- ✅ Optimizaciones de performance
-- ✅ Estrategias de testing con mocks
+Los precios del subyacente y de las opciones son modelos independientes; el P&L se calcula sobre la prima ejecutada de la opción y contempla el multiplicador contractual.
 
-**Público:** Developers, DevOps, QA
+## Inicio rápido
 
----
-
-### 3. [**docs/DEPLOYMENT.md** - Operación y Producción (680 líneas)](docs/DEPLOYMENT.md)
-Guía práctica de deployment y monitoreo:
-- ✅ Preparación de ambiente
-- ✅ Inicialización de journal y snapshots
-- ✅ Validación pre-lanzamiento (checklist)
-- ✅ Ejecución local (debug y release)
-- ✅ Deployment en servidor Linux (systemd)
-- ✅ Containerización con Docker y Docker Compose
-- ✅ Monitoreo en producción
-- ✅ Mantenimiento (rotación logs, backups)
-- ✅ Troubleshooting (problemas comunes)
-- ✅ Rollback a versión anterior
-- ✅ Seguridad (permisos, encriptación)
-
-**Público:** DevOps, SRE, Operators
-
----
-
-## 🎯 Características Principales
-
-### Trading
-- 📊 Detección automática de tendencias (suba/baja) con confirmación de muestras
-- 📈 Compra de CALL en tendencias alcistas
-- 📉 Compra de PUT en tendencias bajistas
-- 💰 Cierre de posición por ganancia mínima (covering de comisiones)
-- 🔄 Cierre por reversión de tendencia
-- ⏱️ Cierre por timeout de posición
-
-### Configurabilidad
-- 🎛️ Ticker configurable (GAL, GGAL, MERV, etc.)
-- ⏰ Intervalo de chequeo de precio
-- 📐 Períodos y muestras de tendencia
-- 💵 Comisiones y impuestos
-- 📊 Ganancia mínima para cierre
-
-### Operación
-- 🔐 Autenticación OAuth 2.0 segura
-- 📡 Manejo robusto de red (retry, circuit breaker)
-- 🧠 Persistencia en memoria (estado en memoria, snapshots opcionales)
-- 📋 Auditoría completa de operaciones
-- 🚨 Alertas y monitoreo
-- 🔄 Recuperación ante crashes
-
-### Performance
-- ⚡ Latencia < 2 segundos compra-venta
-- 🧠 Memoria < 500 MB
-- 🔋 CPU promedio < 30%
-- 🔁 Async/await con Tokio
-- 📦 Caché inteligente de datos
-
----
-
-## 📐 Arquitectura Simplificada
-
-Interfaz: uso de ratatui para la TUI. La UI muestra todos los indicadores clave de forma clara y simple: precio actual, SMA, volatilidad, P&L hipotético, posición activa, tiempo en posición y umbrales. Logs: salida simple y profesional usando tracing (niveles info/warn/error). Además se mantiene un journal/trace append-only de operaciones para auditoría y replay.
-
-
-```mermaid
-flowchart LR
-  Config[Configuration]
-  Market[Market Data]
-  Pattern[Pattern Detector]
-  Trading[Trading Engine]
-  Portfolio[Portfolio Tracker]
-  Persistence[In-memory Storage]
-
-  Config --> Market
-  Market --> Pattern
-  Pattern --> Trading
-  Trading --> Portfolio
-  Portfolio --> Persistence
+```bash
+cargo run
 ```
 
+En una terminal interactiva se abre la TUI. En CI, pipes o con `TUI_ENABLED=false`, se ejecuta en modo headless.
 
----
+Controles de la TUI:
 
-## 🚀 Quick Start
+- `q` o `Esc`: salir con snapshot y flush del journal.
+- `espacio`/`p`: pausar o reanudar el procesamiento.
+- `k`: activar/desactivar el kill switch.
+- `c`: cerrar manualmente la posición al bid disponible.
+- `s`: guardar un snapshot.
 
-### Estado actual de la implementacion
+El replay sintético recorre subas, bajas y reversiones. También se puede proporcionar un dataset JSONL:
 
-El nucleo ejecutable ya incluye configuracion validada, detector de tendencias con SMA, volatilidad y R2, maquina de estados, calculo de P&L, mercado simulado y journal JSONL. El unico modo disponible es `fake`; `MODE=live` falla de forma explicita hasta implementar y probar el cliente IOL.
-
-### 1. Instalación
 ```bash
-git clone <repo-url>
-cd proyecto-options-trading
+REPLAY_PATH=./fixtures/market.jsonl cargo run
+```
+
+Cada línea debe ser un `MarketFrame` con `underlying` y `options`; los tipos serializables están en `src/market.rs`.
+
+## Modos
+
+### Replay
+
+```bash
+MODE=replay cargo run
+```
+
+Usa un dataset local o el escenario sintético incorporado. Las órdenes pasan por `PaperBroker`, que modela slippage y respeta precios límite.
+
+### Paper
+
+```bash
 cp .env.example .env
-nano .env  # Editar con tus credenciales
-cargo build --release
+# completar credenciales
+MODE=paper cargo run
 ```
 
-### 2. Persistencia y modo por defecto
-No se requiere inicializar una base de datos. El sistema mantiene el estado y el histórico en memoria y ofrece snapshots opcionales a disco para recuperación. Por defecto el binario corre en modo "fake" (simulación): no envía compras/ventas reales pero calcula y muestra el P&L hipotético según los parámetros actuales.
+Autentica contra IOL y usa su mercado, pero las órdenes siguen siendo simuladas.
+
+### Live
+
+Live posee tres gates independientes:
 
 ```bash
-# Modo por defecto (fake/simulación)
-RUST_LOG=info cargo run
-
-# El modo live aun no esta implementado y no envia ordenes reales
-MODE=live RUST_LOG=info cargo run
+MODE=live
+LIVE_TRADING_CONFIRMATION=I_UNDERSTAND_THIS_SENDS_REAL_ORDERS
+IOL_ORDER_PATH=/ruta/verificada/por/el/operador
 ```
 
+La ruta no tiene un default deliberadamente: debe corresponder al contrato HTTP verificado para la cuenta/API usada. Una respuesta pendiente o parcialmente ejecutada detiene el motor y activa el kill switch para evitar asumir una ejecución inexistente.
 
-### 3. Ejecutar
+Antes del primer tick operativo, `live` consulta la cartera argentina y las operaciones pendientes de IOL. El motor sólo opera si no hay órdenes de opciones pendientes y la posición local coincide con IOL. Si IOL informa una única CALL/PUT sin estado local, la reconstruye usando cantidad y precio promedio de compra y la evalúa inmediatamente para objetivo de ganancia o stop. Cualquier ambigüedad bloquea el motor y requiere intervención.
+
+## Configuración principal
+
+| Variable | Default | Propósito |
+|---|---:|---|
+| `MODE` | `replay` | `replay`, `paper` o `live` |
+| `TUI_ENABLED` | `true` | Habilitar interfaz interactiva |
+| `CHECK_INTERVAL_SECS` | `1` | Intervalo del motor |
+| `MIN_SAMPLES_FOR_TREND` | `5` | Confirmación de una señal |
+| `TREND_CHANGE_SAMPLES` | `3` | Muestras monotónicas para reversión |
+| `MAX_POSITION_SIZE` | `5` | Contratos por posición |
+| `CONTRACT_MULTIPLIER` | `1` | Unidades por contrato |
+| `MAX_INVESTMENT_AMOUNT` | `100000` | Efectivo máximo por compra, incluida la comisión de entrada |
+| `MAX_LOSS_PER_TRADE` | `5000` | Pérdida neta máxima por operación |
+| `MAX_DAILY_LOSS` | `10000` | Activa el kill switch |
+| `MAX_TRADES_PER_DAY` | `20` | Límite diario |
+| `STOP_LOSS_PERCENTAGE` | `15` | Stop sobre la prima de entrada |
+| `PAPER_SLIPPAGE_BPS` | `5` | Slippage del broker paper |
+| `MAX_MARKET_DATA_AGE_SECS` | `15` | Antigüedad máxima de cotización para decidir u operar |
+| `MAX_OPTION_SPREAD_PERCENTAGE` | `20` | Spread bid/ask máximo permitido para comprar |
+| `DATA_DIR` | `data` | Journal y snapshots por modo |
+| `RECOVER_STATE` | `false` replay, `true` resto | Recuperar snapshot+journal |
+
+La lista completa y sus rangos están en [`src/config.rs`](src/config.rs).
+
+`MAX_NOTIONAL` se acepta como alias legado de `MAX_INVESTMENT_AMOUNT`. La cantidad enviada es el menor valor entre `MAX_POSITION_SIZE` y los contratos que caben en el presupuesto al precio límite, multiplicador contractual y comisión de compra.
+
+En `paper` y `live`, una cotización del subyacente o de la opción activa que excede `MAX_MARKET_DATA_AGE_SECS` activa el kill switch y bloquea decisiones basadas en ese dato. Una opción cuyo spread porcentual sobre el precio medio supera `MAX_OPTION_SPREAD_PERCENTAGE` no puede comprarse. El spread no bloquea una venta ya justificada por objetivo o stop, porque esa operación reduce exposición.
+
+## Persistencia y recuperación
+
+Los datos se guardan bajo `DATA_DIR/<modo>/`:
+
+```text
+journal.jsonl  # eventos append-only, tipados y secuenciados
+state.json     # snapshot completo, versionado y escrito atómicamente
+```
+
+Al recuperar, el motor carga el snapshot, reproduce eventos posteriores y rechaza inconsistencias entre la posición del motor y el portfolio. También detecta órdenes locales sin estado final. En `live`, IOL es la fuente de verdad adicional para cartera y pendientes; ante una discrepancia el comportamiento es fail-closed. `data/` está ignorado por Git.
+
+## Calidad
+
 ```bash
-# Modo debug
-RUST_LOG=debug cargo run
-
-# Modo producción
-./target/release/options-trading
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets
+TUI_ENABLED=false DATA_DIR=/tmp/options-trading-smoke cargo run --quiet
 ```
 
-### 4. Deploy (systemd)
-```bash
-sudo cp target/release/options-trading /usr/local/bin/
-sudo systemctl enable trading-bot
-sudo systemctl start trading-bot
+Los tests cubren señales y reversiones, selección de opciones, P&L, slippage, límites de riesgo, contratos de parsing IOL, journal/snapshot y el ciclo completo de replay.
+
+## Estructura
+
+```text
+src/app.rs          orquestación del ciclo y recuperación
+src/tui.rs          interfaz ratatui/crossterm
+src/market.rs       subyacente, opciones, selección y replay
+src/pattern.rs      detector de tendencia
+src/trading.rs      posiciones, P&L y máquina de estados
+src/risk.rs         límites y kill switch
+src/broker.rs       contrato de órdenes y PaperBroker
+src/iol_client.rs   OAuth, refresh, mercado, retry y órdenes gated
+src/persistence.rs  journal tipado y snapshots
+src/portfolio.rs    posiciones y métricas realizadas
+src/config.rs       configuración validada
 ```
 
----
-
-## 📊 Configuración Esencial
-
-| Variable | Ejemplo | Descripción |
-|----------|---------|-------------|
-| `TICKER` | GAL | Acción a operar |
-| `CHECK_INTERVAL_SECS` | 5 | Chequeo cada 5 segundos |
-| `MIN_SAMPLES_FOR_TREND` | 5 | Confirmar tendencia con 5 muestras |
-| `MIN_PROFIT_MULTIPLIER` | 2.0 | Vender si ganancia = 2 × (comisión + impuesto) |
-| `COMMISSION_PERCENTAGE` | 0.19 | Comisión IOL |
-| `TAX_PERCENTAGE` | 35 | Impuesto ganancias |
-| `OPTION_EXPIRY_DAYS` | 1 | Preferencia vencimiento opciones |
-| `POSITION_TIMEOUT_MINS` | 60 | Cierre forzado después de 60 min |
-
----
-
-## 🏗️ Estructura del Proyecto
-
-```
-proyecto-options-trading/
-├── src/
-│   ├── main.rs                 # CLI de simulacion
-│   ├── lib.rs                  # API publica del dominio
-│   ├── config.rs               # Configuracion y validacion
-│   ├── market.rs               # Cotizaciones, cache y price stream
-│   ├── broker.rs               # Contrato de broker y FakeBroker
-│   ├── pattern.rs              # Detector de tendencias
-│   ├── trading.rs              # Motor de trading y P&L
-│   ├── portfolio.rs            # Seguimiento de posiciones
-│   └── persistence.rs          # Journal y snapshots
-├── docs/
-│   ├── ARCHITECTURE.md         # Este documento
-│   ├── IMPLEMENTATION_DETAILS.md
-│   └── DEPLOYMENT.md
-└── scripts/                    # Scripts auxiliares
-```
-
----
-
-## 🔒 Seguridad
-
-- ✅ Credenciales en variables de ambiente (nunca hardcoded)
-- ✅ Tokens con Zeroize (limpiar de memoria)
-- ✅ Autenticación OAuth 2.0
-- ✅ HTTPS con verificación de certificados
-- ✅ Auditoría completa en el journal (./data/journal/*.jsonl)
-- ✅ Permisos restrictivos en archivos sensibles
-
----
-
-## 📈 Performance
-
-- **Latencia de compra:** < 2 segundos
-- **Detección de tendencia:** < 1 segundo
-- **Uso de memoria:** < 500 MB
-- **CPU promedio:** < 30%
-- **Disponibilidad:** 99.9% (con recuperación automática)
-
----
-
-## 🧪 Testing
-
-- **Unitarios:** Lógica de tendencia, P&L, máquina de estados
-- **Integración:** Cliente IOL, ciclo completo trading
-- **E2E:** Ambiente de testing con IOL (si disponible)
-- **Mocks:** IOL API simulada para tests
-
----
-
-## 📊 Monitoreo
-
-### Logs en Tiempo Real
-```bash
-# Systemd
-journalctl -u trading-bot -f
-
-# Local
-tail -f logs/trading-bot.log
-```
-
-### Métricas Diarias
-```bash
-# Usando el journal (concatenando JSONL) y jq para agregados diarios
-cat ./data/journal/*.jsonl | jq -s '
-  group_by(.action)
-  | map({accion: .[0].action, operaciones: length})'
-```
-
----
-
-
----
-
-## ⚠️ Disclaimers
-
-- **No es asesoramiento financiero.** Úsalo bajo tu propio riesgo.
-- **Testea en ambiente paper/demo primero.**
-- **Monitorea regularmente** las operaciones.
-- **Mantén backups** de datos operacionales.
-- **Revisa logs** en caso de comportamiento inesperado.
-
----
-
-## 📚 Documentos Relacionados
-
-1. [**docs/ARCHITECTURE.md** - Diseño detallado y decisiones](docs/ARCHITECTURE.md)
-2. [**docs/IMPLEMENTATION_DETAILS.md** - Especificación técnica granular](docs/IMPLEMENTATION_DETAILS.md)
-3. [**docs/DEPLOYMENT.md** - Guía de instalación y operación](docs/DEPLOYMENT.md)
-4. [**docs/INDEX.md** - Índice de documentación](docs/INDEX.md)
-5. **Code:** Código fuente en `src/`
-6. **Tests:** Casos unitarios como documentación ejecutable
-
----
-
-## 🤝 Contribuir
-
-Ver `CONTRIBUTING.md` para:
-- Guidelines de código
-- Proceso de pull requests
-- Criterios de aceptación
-
----
-
-## 📞 Soporte
-
-- 🐛 Reportar bugs: GitHub Issues
-- 📖 Preguntas: Revisar documentación primero
-- 🚀 Mejoras: GitHub Discussions
-
----
-
-## 📄 Licencia
-
-Ver archivo `LICENSE`
-
----
-
-**Última actualización:** Agosto 2026  
-**Versión de Documentación:** 1.0
-
+La documentación histórica detallada permanece en [`docs/`](docs/INDEX.md); ante diferencias, el código y este README describen el comportamiento ejecutable actual.

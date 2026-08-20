@@ -1,16 +1,16 @@
 # Detalles de Implementación - Trading de Opciones Rust
 
 Estado de implementacion:
-- El nucleo CLI y de dominio ya esta implementado en `src/`.
-- La UI ratatui queda planificada; actualmente los indicadores se emiten con `tracing`.
-- El cliente live de IOL queda bloqueado hasta contar con un contrato HTTP probado.
+- El motor continuo y el dominio están implementados en `src/` para replay, paper y live gated.
+- La UI ratatui muestra mercado, señal, posición, P&L, riesgo y eventos, con pausa, kill switch, cierre manual y snapshot.
+- El cliente IOL soporta OAuth, refresh, retry/circuit breaker, parsing de cadena y envío de órdenes a una ruta configurada. Live requiere confirmación explícita y contrato HTTP verificado por el operador.
 
 Notas de diseño:
-- UI prevista: ratatui para una TUI limpia que muestre todos los indicadores clave (precio, SMA, volatilidad, P&L hipotético, posición activa, tiempo en posición, umbrales).
+- UI: ratatui/crossterm con precio, SMA, volatilidad, R², P&L, posición, límites, métricas y controles operativos.
 - Logs: salida simple y profesional (tracing, niveles info/warn/error).
 - Trace: journal append-only para auditoría y replay.
 - Persistencia: sin base de datos por defecto — estado en memoria y snapshots opcionales.
-- Modo por defecto: fake/simulación (no ejecuta órdenes, muestra P&L hipotético).
+- Modo por defecto: replay determinístico con órdenes paper; `paper` usa mercado IOL y `live` requiere gates explícitos.
 - Diagramas en la documentación generados con Mermaid para claridad y profesionalismo.
 
 
@@ -58,7 +58,7 @@ OPTION_EXPIRY_DAYS=1              # Opciones corto plazo
 1. Usuario obtiene manualmente credenciales IOL
    
 2. Bot realiza:
-   POST /oauth/authorize
+   POST /token
    Parámetros:
      - username
      - password
@@ -79,8 +79,8 @@ OPTION_EXPIRY_DAYS=1              # Opciones corto plazo
 ### 2.2 Refresh Automático
 
 ```plaintext
-Timer cada 50 minutos:
-  ├─ POST /oauth/token
+Antes de vencer el access token:
+  ├─ POST /token
   │  Parámetros:
   │    - grant_type = "refresh_token"
   │    - refresh_token = stored_token
@@ -251,7 +251,7 @@ Ganancia_Neta = (Precio_Venta - Precio_Compra) × Contratos
                 - Comisión_Doble 
                 - Impuesto
 
-Threshold = (Comisión_Doble + Impuesto) × MIN_PROFIT_MULTIPLIER
+Threshold = Comisión_Doble × MIN_PROFIT_MULTIPLIER
 
 if Ganancia_Neta >= Threshold:
   → VENDER
@@ -282,6 +282,21 @@ if IOL retorna 5XX o conexión cae:
   if sigue fallando:
     → VENDER (stop defensivo)
     → Alerta crítica
+```
+
+**Condición E: Calidad de mercado**
+```plaintext
+if antigüedad_cotización > MAX_MARKET_DATA_AGE_SECS:
+  → Activar kill switch
+  → No comprar ni vender usando esa cotización
+
+spread_pct = (ask - bid) / ((ask + bid) / 2) × 100
+if nueva entrada y spread_pct > MAX_OPTION_SPREAD_PERCENTAGE:
+  → Activar kill switch
+  → Rechazar compra
+
+Una venta ya justificada por objetivo o stop puede continuar con spread amplio,
+porque reduce exposición, siempre que la cotización no esté obsoleta.
 ```
 
 ---
@@ -389,7 +404,7 @@ El sistema no usa una base de datos por defecto. La persistencia se basa en estr
 ### Diseño principal
 - Estado en memoria: DashMap / Mutex-protected HashMap para posiciones, vector para buffer de precios y vectores/colas para el journal.
 - Journal append-only (opcional): entradas serializadas (JSON) escritas en disco para permitir replay en caso de inconsistencia.
-- Snapshots periódicos: serializar el estado completo a JSON.gz cada N minutos (configurable). Al iniciar, cargar el snapshot más reciente y reprocesar el journal.
+- Snapshots periódicos: serializar el estado completo a JSON mediante escritura temporal + rename atómico. Al iniciar, cargar el snapshot y reprocesar los eventos posteriores del journal.
 
 ### Estructuras clave (ejemplo conceptual)
 - operations: Vec<OperationRecord> (operaciones históricas en memoria)
@@ -424,7 +439,7 @@ snapshot = {
 }
 
 Guardado en:
-  1. Archivo JSON comprimido: state_snapshot.json.gz
+  1. Archivo JSON atómico: state.json
 
 Uso en recuperación:
   - Si bot se reinicia: cargar snapshot más reciente
@@ -595,4 +610,3 @@ Evento: UNUSUAL_PNL
 ---
 
 **Documento de Implementación - v1.0**
-

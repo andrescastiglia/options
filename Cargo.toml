@@ -2,15 +2,17 @@
 name = "options-trading"
 version = "0.1.0"
 edition = "2021"
-description = "Sistema de simulacion de trading de opciones para IOL"
+description = "Motor de replay, paper y trading gated de opciones para IOL"
 
 [dependencies]
+crossterm = "0.28"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"
 dotenvy = "0.15"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-tokio = { version = "1", features = ["time"] }
+ratatui = "0.29"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 zeroize = "1"

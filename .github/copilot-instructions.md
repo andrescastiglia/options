@@ -75,9 +75,11 @@ Antes de cambiar una decision arquitectonica, revisar estas fuentes y mantenerla
   - `comision = precio_compra * contratos * (commission / 100) + precio_venta * contratos * (commission / 100)`
   - `impuesto = max(ganancia_bruta, 0) * (tax / 100)`
   - `ganancia_neta = ganancia_bruta - comision - impuesto`
-  - `threshold = (comision + impuesto) * MIN_PROFIT_MULTIPLIER`
+  - `threshold = comision * MIN_PROFIT_MULTIPLIER`
 - Mantener consistencia entre el calculo de entrada, salida, comisiones, impuestos y journal.
 - Respetar `MAX_POSITION_SIZE` y `POSITION_TIMEOUT_MINS`; nunca abrir posiciones duplicadas por reintentos.
+- Rechazar decisiones basadas en cotizaciones obsoletas y bloquear compras con spread bid/ask superior al límite configurado.
+- No bloquear una venta que reduce exposición solamente por spread amplio; sí bloquearla si la cotización es obsoleta.
 - En una falla durante el cierre, reintentar con backoff, alertar y dejar trazabilidad para intervencion manual.
 
 ## Persistencia, recuperacion y auditoria

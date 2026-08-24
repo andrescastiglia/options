@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     broker::{OrderExecution, OrderSide},
     errors::AppError,
+    iol_client::CostCalibration,
+    learning::{LearningState, LiveStage, ValidationTrade},
     market::MarketFrame,
     pattern::{Direction, Trend, TrendDetector},
     portfolio::Portfolio,
@@ -16,7 +18,7 @@ use crate::{
     trading::{ExitReason, Pnl, Position, TradingEngine},
 };
 
-pub const SNAPSHOT_VERSION: u32 = 1;
+pub const SNAPSHOT_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -48,6 +50,12 @@ pub enum JournalEventKind {
     },
     KillSwitch {
         active: bool,
+    },
+    LiveStageChanged {
+        from: LiveStage,
+        to: LiveStage,
+        reason: String,
+        epoch: u64,
     },
     Recovery {
         message: String,
@@ -87,6 +95,18 @@ pub struct RuntimeSnapshot {
     pub last_traded_signal: Option<Direction>,
     pub ticks: u64,
     pub selected_option: Option<String>,
+    #[serde(default)]
+    pub live_stage: LiveStage,
+    #[serde(default)]
+    pub learning_state: LearningState,
+    #[serde(default)]
+    pub trading_performance: Vec<ValidationTrade>,
+    #[serde(default)]
+    pub return_to_learning_pending: bool,
+    #[serde(default)]
+    pub cooldown_until_secs: i64,
+    #[serde(default)]
+    pub cost_calibration: Option<CostCalibration>,
 }
 
 impl Snapshot {
@@ -133,13 +153,14 @@ pub fn save_snapshot(path: impl AsRef<Path>, snapshot: &Snapshot) -> Result<(), 
 
 pub fn load_snapshot(path: impl AsRef<Path>) -> Result<Snapshot, AppError> {
     let bytes = std::fs::read(path)?;
-    let snapshot: Snapshot = serde_json::from_slice(&bytes)?;
-    if snapshot.version != SNAPSHOT_VERSION {
+    let mut snapshot: Snapshot = serde_json::from_slice(&bytes)?;
+    if snapshot.version != 1 && snapshot.version != SNAPSHOT_VERSION {
         return Err(AppError::Recovery(format!(
             "version de snapshot {} no soportada",
             snapshot.version
         )));
     }
+    snapshot.version = SNAPSHOT_VERSION;
     Ok(snapshot)
 }
 
@@ -264,6 +285,12 @@ mod tests {
                 last_traded_signal: None,
                 ticks: 0,
                 selected_option: None,
+                live_stage: LiveStage::Learning,
+                learning_state: LearningState::default(),
+                trading_performance: Vec::new(),
+                return_to_learning_pending: false,
+                cooldown_until_secs: 0,
+                cost_calibration: None,
             },
         );
         save_snapshot(&path, &snapshot).unwrap();

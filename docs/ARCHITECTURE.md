@@ -54,11 +54,11 @@ flowchart LR
 ```plaintext
 # Credenciales IOL
 IOL_USERNAME=tu_usuario
-IOL_PASSWORD=tu_contraseña
+IOL_PASSWORD=base64_generado_con_-e
 IOL_REFRESH_TOKEN=token_inicial_refresh
 
 # Parámetros de operación
-TICKER=GAL                          # Ticker base (configurable)
+TICKER=GGAL                         # Ticker base (configurable)
 CHECK_INTERVAL_SECS=5              # Intervalo de chequeo de precio (segundos)
 PRICE_HISTORY_MINUTES=30           # Período de histórico para detectar tendencia
 MIN_SAMPLES_FOR_TREND=5            # Cantidad mínima de muestras para confirmar tendencia
@@ -266,7 +266,7 @@ flowchart TD
 flowchart TD
   Loop[Loop cada CHECK_INTERVAL_SECS] --> Auth[Verificar autenticación (¿token expirado?)]
   Auth -->|si| Refresh[Refresh automático]
-  Auth -->|no| Request[Request a IOL API: GET /api/v2/opciones/{ticker}]
+  Auth -->|no| Request[Consultar cotización, catálogo y panel de opciones IOL]
   Request --> Parse[Parsear JSON y extraer precio de última venta]
   Parse --> Validar[Validar datos (precio > 0?, timestamp reciente?)]
   Validar --> Agregar[Agregar a buffer histórico con timestamp]
@@ -462,7 +462,7 @@ zeroize = "1"  # Para seguridad de credenciales
 - [x] Validación de consistencia y aislamiento de datos en tests
 
 ### Fase 5: Integración y Polish (Semana 5-6)
-- [x] Integración end-to-end en replay/paper
+- [x] Integración end-to-end readonly/live
 - [x] Manejo de errores, órdenes no resueltas y kill switch
 - [x] Logging estructurado, métricas y TUI
 - [x] Tests de contratos y ciclo completo simulado
@@ -473,7 +473,7 @@ zeroize = "1"  # Para seguridad de credenciales
 - [x] Monitoreo local mediante TUI y tracing
 - [x] Documentación de operación local y gates live
 
-Estado de producción: `replay` y `paper` están implementados. `live` dispone del adaptador HTTP, exige confirmación explícita y una ruta de órdenes verificada por el operador; respuestas pendientes o parciales detienen el motor. El arranque reconcilia cartera y órdenes pendientes de IOL con el estado local. Antes de operar capital real aún se requieren validación prolongada en paper y alertas externas con confirmación del operador.
+Estado de producción: sólo existen `readonly` y `live`. Ambos comienzan en Learning y pasan automáticamente a la etapa Live al aprobar los criterios de [`plan.md`](plan.md). Readonly continúa simulando y sólo avisa; live puede enviar órdenes reales si además cuenta con confirmación explícita, ruta verificada y cuenta reconciliada. Respuestas pendientes o parciales detienen el motor.
 
 ---
 

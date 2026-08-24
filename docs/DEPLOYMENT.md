@@ -45,11 +45,11 @@ cargo build --release
 ```plaintext
 # === CREDENCIALES IOL ===
 IOL_USERNAME=tu_usuario_iol
-IOL_PASSWORD=tu_contraseña_segura
+IOL_PASSWORD=base64_generado_con_-e
 IOL_REFRESH_TOKEN=token_refresh_inicial
 
 # === PARÁMETROS DE OPERACIÓN ===
-TICKER=GAL
+TICKER=GGAL
 CHECK_INTERVAL_SECS=5
 PRICE_HISTORY_MINUTES=30
 MIN_SAMPLES_FOR_TREND=5
@@ -88,8 +88,8 @@ No es necesario inicializar una base de datos. Por defecto el bot mantiene el es
 
 ```bash
 # Crear directorios
-mkdir -p ./data/replay ./data/paper ./data/live
-chmod 700 ./data/replay ./data/paper ./data/live
+mkdir -p ./data/readonly ./data/live
+chmod 700 ./data/readonly ./data/live
 ```
 
 ### 2.2 Verificación rápida
@@ -97,8 +97,8 @@ chmod 700 ./data/replay ./data/paper ./data/live
 ```bash
 # Verificar que la app puede escribir snapshots (simulación)
 TUI_ENABLED=false DATA_DIR=./data cargo run
-test -s ./data/replay/journal.jsonl
-test -s ./data/replay/state.json
+test -s ./data/readonly/journal.jsonl
+test -s ./data/readonly/state.json
 ```
 
 # Opcional: Si se desea usar SQLite/Postgres/otro backend, habilitar con la variable DATABASE_URL y proveer el script SQL correspondiente (no usado por defecto).
@@ -112,7 +112,7 @@ test -s ./data/replay/state.json
 
 ```plaintext
 □ .env existe y tiene permisos 600 (no world-readable)
-□ IOL_USERNAME y IOL_PASSWORD son correctos
+□ IOL_USERNAME es correcto e IOL_PASSWORD contiene el Base64 generado con `-e` en esta máquina
 □ IOL_REFRESH_TOKEN está presente
 □ TICKER es válido en IOL (GAL, GGAL, MERV, etc.)
 □ CHECK_INTERVAL_SECS >= 1 y <= 60
@@ -560,7 +560,7 @@ Síntoma: [ERROR] Fallo en autenticación a IOL
 
 Solución:
 1. Verificar credenciales en .env
-   └─ IOL_USERNAME y IOL_PASSWORD correctos?
+   └─ ¿IOL_USERNAME es correcto e IOL_PASSWORD fue generado con `-e` en esta máquina?
    
 2. Verificar que IOL API está disponible
    └─ curl https://api.invertironline.com/

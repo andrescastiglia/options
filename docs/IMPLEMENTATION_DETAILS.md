@@ -1,7 +1,7 @@
 # Detalles de Implementación - Trading de Opciones Rust
 
 Estado de implementacion:
-- El motor continuo y el dominio están implementados en `src/` para replay, paper y live gated.
+- El motor continuo está implementado para `readonly` y `live`, ambos con etapas automáticas Learning y Live. Readonly sólo simula y avisa; live opera realmente sólo en su etapa Live.
 - La UI ratatui muestra mercado, señal, posición, P&L, riesgo y eventos, con pausa, kill switch, cierre manual y snapshot.
 - El cliente IOL soporta OAuth, refresh, retry/circuit breaker, parsing de cadena y envío de órdenes a una ruta configurada. Live requiere confirmación explícita y contrato HTTP verificado por el operador.
 
@@ -10,7 +10,7 @@ Notas de diseño:
 - Logs: salida simple y profesional (tracing, niveles info/warn/error).
 - Trace: journal append-only para auditoría y replay.
 - Persistencia: sin base de datos por defecto — estado en memoria y snapshots opcionales.
-- Modo por defecto: replay determinístico con órdenes paper; `paper` usa mercado IOL y `live` requiere gates explícitos.
+- Modo por defecto: `readonly`, conectado a IOL y sin capacidad de enviar órdenes. `live` comparte el gate y habilita órdenes sólo después de aprobar Learning.
 - Diagramas en la documentación generados con Mermaid para claridad y profesionalismo.
 
 
@@ -307,7 +307,7 @@ porque reduce exposición, siempre que la cotización no esté obsoleta.
 
 ```plaintext
 1. BUSCAR OPCIÓN
-   GET /api/v2/opciones/{ticker}
+   GET /api/v2/BCBA/Titulos/{ticker}/Opciones
    ├─ Parsear respuesta JSON
    ├─ Filtrar por vencimiento (OPTION_EXPIRY_DAYS)
    ├─ Ordenar por strike
@@ -353,8 +353,8 @@ porque reduce exposición, siempre que la cotización no esté obsoleta.
 
 ```plaintext
 1. OBTENER PRECIO ACTUAL
-   GET /api/v2/opciones/{ticker}/{strikeOpción}
-   └─ Extraer bid_price
+   GET /api/v2/Cotizaciones/Opciones/Todas/Argentina
+   └─ Buscar símbolo y extraer precioCompra/precioVenta
 
 2. CALCULAR P&L
    ganancia_bruta = (bid_price - precio_entrada) × cantidad
@@ -506,7 +506,7 @@ Validación en startup:
 Problema: Consultar strikes cada ciclo es costoso
 
 Solución:
-  1. GET /api/v2/opciones/{ticker} → Guardar en caché
+  1. GET /api/v2/BCBA/Titulos/{ticker}/Opciones → Guardar catálogo en caché
   2. TTL: 1 hora (o cambio de precio > 5%)
   3. Hit rate esperado: > 90%
   4. Mem consumida: ~50KB por ticker
@@ -552,7 +552,7 @@ mock_iol_server:
   - Validación de órdenes
 
 Ejemplo:
-  GET /api/v2/opciones/GAL
+  GET /api/v2/BCBA/Titulos/GGAL/Opciones
   ├─ Call 1: Retorna [CALL 105@2.15, PUT 100@1.80]
   ├─ Call 2: Retorna [CALL 105@2.30]
   └─ Call 3: Retorna error 503 (para testear retry)

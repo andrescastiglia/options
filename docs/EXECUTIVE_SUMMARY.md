@@ -276,7 +276,7 @@ flowchart TB
 ### Mediano Plazo (Meses 3-6)
 - [ ] Machine learning para ajuste automático de parámetros
 - [ ] Backtesting engine
-- [ ] Paper trading mode
+- [x] Modo readonly conectado a IOL, sin envío de órdenes
 - [ ] Multiple tickers simultáneamente
 
 ### Largo Plazo (Meses 6+)
@@ -336,7 +336,7 @@ Sistema robusto y performante para trading automático de opciones, diseñado co
 ✅ **Seguridad:** Credenciales protegidas, sin hardcoding  
 ✅ **Escalabilidad:** Preparado para expansión futura  
 
-**Replay y paper están listos para validación. Producción live requiere paper trading prolongado, contrato IOL verificado, reconciliación de órdenes y alertas externas.**
+**Readonly y live comparten validación automática Learning ↔ Live. Readonly sólo avisa; las órdenes reales exigen además contrato IOL verificado, confirmación explícita y reconciliación de cuenta.**
 
 ---
 

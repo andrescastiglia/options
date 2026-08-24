@@ -1,8 +1,8 @@
 # Options Trading para IOL
 
-Motor de trading de opciones en Rust con replay determinístico, paper trading sobre datos de IOL, controles de riesgo, journal recuperable y una TUI de monitoreo.
+Motor de señales y trading de opciones en Rust conectado a IOL, con controles de riesgo, journal recuperable y una TUI de monitoreo.
 
-El modo predeterminado es `replay`: nunca envía órdenes reales. `paper` consume mercado de IOL pero ejecuta órdenes en el broker simulado. `live` requiere activación explícita y un contrato de órdenes configurado por el operador.
+Sólo hay dos modos. `readonly` nunca envía órdenes: aprende, simula resultados y avisa cuándo debería comprar o vender. `live` usa el mismo ciclo automático `Learning ↔ Live`, pero en la etapa Live sí puede enviar órdenes reales después de aprobar todos los gates.
 
 > No es asesoramiento financiero. La estrategia incluida es simple y sirve para validar la plataforma; su rentabilidad no está demostrada.
 
@@ -11,16 +11,25 @@ El modo predeterminado es `replay`: nunca envía órdenes reales. `paper` consum
 1. Obtiene el precio del subyacente y su cadena de opciones.
 2. Calcula SMA, pendiente, volatilidad, R² y confirmación consecutiva.
 3. Una suba confirmada busca una CALL; una baja confirmada busca una PUT.
-4. Selecciona una opción líquida por vencimiento y cercanía del strike.
-5. Calcula la cantidad que entra en el presupuesto de compra, incluida la comisión.
+4. Filtra spread, volumen, vencimiento, distancia al dinero y frescura; luego elige la serie de menor fricción.
+5. Calcula la cantidad que entra simultáneamente en el presupuesto y en la pérdida neta máxima.
 6. Valida pérdidas y cantidad diaria de operaciones.
-7. Envía una orden limitada idempotente al broker paper o live.
+7. Muestra la acción en readonly o envía una orden limitada exclusivamente en `MODE=live` y etapa Live.
 8. Cierra por objetivo neto, stop-loss, reversión, timeout o cierre manual.
 9. Registra eventos tipados y snapshots atómicos para recuperación.
+10. Calibra comisión, IVA y otros aranceles con la última operación terminada de IOL.
 
 Los precios del subyacente y de las opciones son modelos independientes; el P&L se calcula sobre la prima ejecutada de la opción y contempla el multiplicador contractual.
 
 ## Inicio rápido
+
+Antes de usar `readonly` o `live`, cifrá la contraseña de IOL en la misma máquina donde se ejecutará el programa:
+
+```bash
+cargo run -- -e "tu contraseña de IOL"
+```
+
+El comando imprime un único texto Base64 y termina. Copialo manualmente en `IOL_PASSWORD` dentro de `.env`. El valor queda ligado a `/etc/machine-id`, por lo que hay que generarlo nuevamente al cambiar de máquina.
 
 ```bash
 cargo run
@@ -36,37 +45,23 @@ Controles de la TUI:
 - `c`: cerrar manualmente la posición al bid disponible.
 - `s`: guardar un snapshot.
 
-El replay sintético recorre subas, bajas y reversiones. También se puede proporcionar un dataset JSONL:
-
-```bash
-REPLAY_PATH=./fixtures/market.jsonl cargo run
-```
-
-Cada línea debe ser un `MarketFrame` con `underlying` y `options`; los tipos serializables están en `src/market.rs`.
-
 ## Modos
 
-### Replay
-
-```bash
-MODE=replay cargo run
-```
-
-Usa un dataset local o el escenario sintético incorporado. Las órdenes pasan por `PaperBroker`, que modela slippage y respeta precios límite.
-
-### Paper
+### Readonly
 
 ```bash
 cp .env.example .env
 # completar credenciales
-MODE=paper cargo run
+MODE=readonly cargo run
 ```
 
-Autentica contra IOL y usa su mercado, pero las órdenes siguen siendo simuladas.
+Autentica contra IOL y usa mercado real. Learning genera operaciones virtuales para reunir evidencia. Cuando aprueba el gate pasa a la etapa Live, donde continúa simulando y muestra `debería COMPRAR` o `debería VENDER` en consola/TUI. El enrutador de readonly nunca invoca el endpoint de órdenes.
 
 ### Live
 
-Live posee tres gates independientes:
+Live tiene las mismas dos etapas persistentes. Learning simula; al aprobar el gate cambia automáticamente a la etapa Live y recién allí puede operar dinero real. Una regresión o calibración vencida/cambiada bloquea entradas y vuelve a Learning al quedar plano.
+
+Además del gate estadístico, el envío de dinero real requiere estas dos variables. Pueden dejarse comentadas durante Learning; en ese caso el programa aprende pero no se promueve:
 
 ```bash
 MODE=live
@@ -76,35 +71,57 @@ IOL_ORDER_PATH=/ruta/verificada/por/el/operador
 
 La ruta no tiene un default deliberadamente: debe corresponder al contrato HTTP verificado para la cuenta/API usada. Una respuesta pendiente o parcialmente ejecutada detiene el motor y activa el kill switch para evitar asumir una ejecución inexistente.
 
-Antes del primer tick operativo, `live` consulta la cartera argentina y las operaciones pendientes de IOL. El motor sólo opera si no hay órdenes de opciones pendientes y la posición local coincide con IOL. Si IOL informa una única CALL/PUT sin estado local, la reconstruye usando cantidad y precio promedio de compra y la evalúa inmediatamente para objetivo de ganancia o stop. Cualquier ambigüedad bloquea el motor y requiere intervención.
+Antes del primer tick y periódicamente, `live` reconcilia cartera y órdenes de IOL. Cualquier ambigüedad bloquea el motor. Cada modo guarda su elegibilidad en `DATA_DIR/<modo>/learning-eligibility.json`.
+
+## Transporte IOL y datos de cuenta
+
+IOL documenta actualmente WebSocket sólo para movimientos de cuenta. En ambos modos la aplicación abre `IOL_WEBSOCKET_URL`; mercado, perfil, cartera, operaciones y órdenes permanecen sobre REST.
+
+El TUI muestra número de cuenta comitente, nombre y apellido obtenidos de `/api/v2/datos-perfil`, además del estado del WebSocket. Si el WebSocket rechaza una cuenta no habilitada para ese servicio, el estado se informa y las capacidades REST continúan operativas.
+
+Al iniciar, los costos configurados en variables de entorno son el fallback. Después de autenticar, se consulta la última operación terminada y su detalle: los renglones de `aranceles` se separan en comisión, IVA y otros cargos, se convierten a porcentajes del monto operado y reemplazan la estimación sólo en memoria. Al finalizar se consulta nuevamente y se imprime una sugerencia lista para copiar; el programa nunca modifica `.env` automáticamente.
 
 ## Configuración principal
 
 | Variable | Default | Propósito |
 |---|---:|---|
-| `MODE` | `replay` | `replay`, `paper` o `live` |
+| `MODE` | `readonly` | `readonly` o `live` |
+| `TICKER` | `GGAL` | Símbolo subyacente de BCBA |
 | `TUI_ENABLED` | `true` | Habilitar interfaz interactiva |
 | `CHECK_INTERVAL_SECS` | `1` | Intervalo del motor |
-| `MIN_SAMPLES_FOR_TREND` | `5` | Confirmación de una señal |
-| `TREND_CHANGE_SAMPLES` | `3` | Muestras monotónicas para reversión |
+| `MIN_SAMPLES_FOR_TREND` | `30` | Confirmación consecutiva de una señal robusta |
+| `TREND_CHANGE_SAMPLES` | `5` | Confirmaciones robustas para reversión |
+| `TREND_DEADBAND_PERCENTAGE` | `0.10` | Separación mínima respecto de la SMA |
+| `MIN_TREND_R_SQUARED` | `0.60` | Calidad lineal mínima de la tendencia |
 | `MAX_POSITION_SIZE` | `5` | Contratos por posición |
 | `CONTRACT_MULTIPLIER` | `1` | Unidades por contrato |
+| `COMMISSION_PERCENTAGE` | `0.19` | Comisión neta estimada; se calibra con la última operación |
+| `VAT_PERCENTAGE` | `21` | IVA estimado sobre comisión y otros aranceles netos |
+| `OTHER_FEES_PERCENTAGE` | `0` | Derechos de mercado y otros cargos netos sobre el monto |
+| `TAX_PERCENTAGE` | `35` | Impuesto estimado sobre ganancia positiva; no representa IVA |
 | `MAX_INVESTMENT_AMOUNT` | `100000` | Efectivo máximo por compra, incluida la comisión de entrada |
 | `MAX_LOSS_PER_TRADE` | `5000` | Pérdida neta máxima por operación |
 | `MAX_DAILY_LOSS` | `10000` | Activa el kill switch |
 | `MAX_TRADES_PER_DAY` | `20` | Límite diario |
 | `STOP_LOSS_PERCENTAGE` | `15` | Stop sobre la prima de entrada |
-| `PAPER_SLIPPAGE_BPS` | `5` | Slippage del broker paper |
+| `MIN_REWARD_RISK_RATIO` | `1.25` | Beneficio neto objetivo mínimo respecto del riesgo neto |
+| `READONLY_SLIPPAGE_BPS` | `5` | Slippage de señales virtuales en etapa Live de readonly |
+| `LEARNING_SLIPPAGE_BPS` | `25` | Slippage conservador en Learning |
 | `MAX_MARKET_DATA_AGE_SECS` | `15` | Antigüedad máxima de cotización para decidir u operar |
-| `MAX_OPTION_SPREAD_PERCENTAGE` | `20` | Spread bid/ask máximo permitido para comprar |
+| `MAX_OPTION_SPREAD_PERCENTAGE` | `3` | Spread bid/ask máximo permitido para comprar |
+| `MIN_OPTION_VOLUME` | `10` | Volumen mínimo de la serie |
+| `LIVE_LEARNING_MIN_TRADES` | `200` | Cierres mínimos del epoch antes de evaluar el gate |
 | `DATA_DIR` | `data` | Journal y snapshots por modo |
-| `RECOVER_STATE` | `false` replay, `true` resto | Recuperar snapshot+journal |
+| `RECOVER_STATE` | `true` | Recuperar snapshot+journal |
+| `IOL_WEBSOCKET_URL` | `wss://websocket-movements.invertironline.com/` | WebSocket oficial de movimientos |
 
 La lista completa y sus rangos están en [`src/config.rs`](src/config.rs).
 
-`MAX_NOTIONAL` se acepta como alias legado de `MAX_INVESTMENT_AMOUNT`. La cantidad enviada es el menor valor entre `MAX_POSITION_SIZE` y los contratos que caben en el presupuesto al precio límite, multiplicador contractual y comisión de compra.
+`MAX_NOTIONAL` se acepta como alias legado de `MAX_INVESTMENT_AMOUNT`. La cantidad enviada es el menor valor entre `MAX_POSITION_SIZE` y los contratos que caben en el presupuesto al precio límite, multiplicador contractual y costo operativo efectivo de compra. Ese costo es `(COMMISSION_PERCENTAGE + OTHER_FEES_PERCENTAGE) × (1 + VAT_PERCENTAGE / 100)`.
 
-En `paper` y `live`, una cotización del subyacente o de la opción activa que excede `MAX_MARKET_DATA_AGE_SECS` activa el kill switch y bloquea decisiones basadas en ese dato. Una opción cuyo spread porcentual sobre el precio medio supera `MAX_OPTION_SPREAD_PERCENTAGE` no puede comprarse. El spread no bloquea una venta ya justificada por objetivo o stop, porque esa operación reduce exposición.
+El cálculo cobra ese costo efectivo dos veces y sobre bases distintas: una vez sobre el importe de compra y otra sobre el importe de venta. Por eso `P&L neto = bruto - costo de compra - costo de venta - impuesto`. `TAX_PERCENTAGE` se aplica solamente a una ganancia bruta positiva; el IVA ya está incluido en los costos de ambas puntas.
+
+En `readonly` y `live`, una cotización obsoleta activa el kill switch. Una opción cuyo spread supera `MAX_OPTION_SPREAD_PERCENTAGE` no puede abrirse; el spread no impide cerrar exposición.
 
 ## Persistencia y recuperación
 
@@ -126,7 +143,7 @@ cargo test --all-targets
 TUI_ENABLED=false DATA_DIR=/tmp/options-trading-smoke cargo run --quiet
 ```
 
-Los tests cubren señales y reversiones, selección de opciones, P&L, slippage, límites de riesgo, contratos de parsing IOL, journal/snapshot y el ciclo completo de replay.
+Los tests cubren señales y reversiones, selección de opciones, P&L, slippage, límites de riesgo, contratos REST/WebSocket de IOL, calibración de aranceles, journal/snapshot y el ciclo completo de replay.
 
 ## Estructura
 
@@ -138,7 +155,7 @@ src/pattern.rs      detector de tendencia
 src/trading.rs      posiciones, P&L y máquina de estados
 src/risk.rs         límites y kill switch
 src/broker.rs       contrato de órdenes y PaperBroker
-src/iol_client.rs   OAuth, refresh, mercado, retry y órdenes gated
+src/iol_client.rs   WebSocket de movimientos y fallback REST por capacidad
 src/persistence.rs  journal tipado y snapshots
 src/portfolio.rs    posiciones y métricas realizadas
 src/config.rs       configuración validada

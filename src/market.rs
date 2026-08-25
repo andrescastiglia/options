@@ -199,6 +199,65 @@ pub fn select_option(
         })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OptionSelectionCriteria {
+    pub min_expiry_days: u32,
+    pub target_expiry_days: u32,
+    pub max_expiry_days: u32,
+    pub min_volume: u64,
+    pub max_spread_percentage: f64,
+    pub max_moneyness_distance_percentage: f64,
+    pub now_secs: i64,
+    pub max_age_secs: u64,
+    pub operating_cost_percentage: f64,
+    pub slippage_bps: f64,
+}
+
+pub fn select_option_with_criteria(
+    frame: &MarketFrame,
+    kind: OptionKind,
+    criteria: OptionSelectionCriteria,
+) -> Option<&OptionQuote> {
+    frame
+        .options
+        .iter()
+        .filter(|option| {
+            let moneyness =
+                ((option.strike - frame.underlying.last).abs() / frame.underlying.last) * 100.0;
+            option.kind == kind
+                && option.expiry_days >= criteria.min_expiry_days
+                && option.expiry_days <= criteria.max_expiry_days
+                && option.volume >= criteria.min_volume
+                && moneyness <= criteria.max_moneyness_distance_percentage
+                && option
+                    .validate_entry_quality(
+                        criteria.now_secs,
+                        criteria.max_age_secs,
+                        criteria.max_spread_percentage,
+                    )
+                    .is_ok()
+        })
+        .min_by(|left, right| {
+            let friction = |option: &OptionQuote| {
+                option.spread_percentage().unwrap_or(f64::INFINITY)
+                    + 2.0 * criteria.operating_cost_percentage
+                    + 2.0 * criteria.slippage_bps / 100.0
+            };
+            let moneyness = |option: &OptionQuote| {
+                ((option.strike - frame.underlying.last).abs() / frame.underlying.last) * 100.0
+            };
+            friction(left)
+                .total_cmp(&friction(right))
+                .then_with(|| right.volume.cmp(&left.volume))
+                .then_with(|| moneyness(left).total_cmp(&moneyness(right)))
+                .then_with(|| {
+                    left.expiry_days
+                        .abs_diff(criteria.target_expiry_days)
+                        .cmp(&right.expiry_days.abs_diff(criteria.target_expiry_days))
+                })
+        })
+}
+
 pub trait MarketDataProvider {
     type Error;
 
@@ -458,5 +517,37 @@ mod tests {
             .validate_entry_quality(1, 10, 20.0)
             .is_err());
         assert!((frame.options[0].spread_percentage().unwrap() - 66.666_666).abs() < 1e-5);
+    }
+
+    #[test]
+    fn criteria_skip_a_bad_series_and_select_a_valid_alternative() {
+        let mut market = ReplayMarket::synthetic("GAL");
+        let mut frame = market.next_frame().unwrap().unwrap();
+        let nearest = frame
+            .options
+            .iter_mut()
+            .find(|option| option.kind == OptionKind::Call && option.strike == 100.0)
+            .unwrap();
+        nearest.bid = Some(1.0);
+        nearest.ask = Some(2.0);
+        let selected = select_option_with_criteria(
+            &frame,
+            OptionKind::Call,
+            OptionSelectionCriteria {
+                min_expiry_days: 1,
+                target_expiry_days: 1,
+                max_expiry_days: 45,
+                min_volume: 10,
+                max_spread_percentage: 10.0,
+                max_moneyness_distance_percentage: 10.0,
+                now_secs: 1,
+                max_age_secs: 10,
+                operating_cost_percentage: 0.2,
+                slippage_bps: 25.0,
+            },
+        )
+        .unwrap();
+        assert_ne!(selected.strike, 100.0);
+        assert!(selected.validate_entry_quality(1, 10, 10.0).is_ok());
     }
 }

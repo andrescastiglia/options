@@ -57,6 +57,8 @@ pub struct Config {
     pub data_dir: PathBuf,
     pub replay_path: Option<PathBuf>,
     pub capture_market_data: bool,
+    pub connection_retry_attempts: u32,
+    pub connection_retry_delay_secs: u64,
     pub max_investment_amount: f64,
     pub max_loss_per_trade: f64,
     pub max_daily_loss: f64,
@@ -151,6 +153,8 @@ impl Config {
             data_dir: PathBuf::from(env_or("DATA_DIR", "data")),
             replay_path: env::var("REPLAY_PATH").ok().map(PathBuf::from),
             capture_market_data: parse_bool("CAPTURE_MARKET_DATA", true)?,
+            connection_retry_attempts: parse_u32("CONNECTION_RETRY_ATTEMPTS", 3)?,
+            connection_retry_delay_secs: parse_u64("CONNECTION_RETRY_DELAY_SECS", 5)?,
             max_investment_amount: parse_f64_with_legacy(
                 "MAX_INVESTMENT_AMOUNT",
                 "MAX_NOTIONAL",
@@ -210,6 +214,18 @@ impl Config {
 
     pub fn validate(&self) -> Result<(), ConfigError> {
         bounded("CHECK_INTERVAL_SECS", self.check_interval_secs, 1, 60)?;
+        bounded(
+            "CONNECTION_RETRY_ATTEMPTS",
+            self.connection_retry_attempts,
+            1,
+            20,
+        )?;
+        bounded(
+            "CONNECTION_RETRY_DELAY_SECS",
+            self.connection_retry_delay_secs,
+            1,
+            300,
+        )?;
         bounded("PRICE_HISTORY_MINUTES", self.price_history_minutes, 1, 120)?;
         bounded("MIN_SAMPLES_FOR_TREND", self.min_samples_for_trend, 2, 100)?;
         bounded("TREND_CHANGE_SAMPLES", self.trend_change_samples, 2, 100)?;
@@ -524,6 +540,8 @@ mod tests {
             data_dir: PathBuf::from("data"),
             replay_path: None,
             capture_market_data: true,
+            connection_retry_attempts: 3,
+            connection_retry_delay_secs: 5,
             max_investment_amount: 100_000.0,
             max_loss_per_trade: 5_000.0,
             max_daily_loss: 10_000.0,
@@ -566,6 +584,16 @@ mod tests {
     #[test]
     fn readonly_defaults_are_valid() {
         assert!(config().validate().is_ok());
+    }
+
+    #[test]
+    fn connection_retry_policy_has_safe_bounds() {
+        let mut config = config();
+        config.connection_retry_attempts = 0;
+        assert!(config.validate().is_err());
+        config.connection_retry_attempts = 3;
+        config.connection_retry_delay_secs = 301;
+        assert!(config.validate().is_err());
     }
 
     #[test]

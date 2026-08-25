@@ -44,6 +44,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     let mut app = TradingApp::new(config)?;
     let result = if use_tui {
+        if let Err(error) = connect_before_tui(&mut app).await {
+            let _ = app.shutdown_with_status(false).await;
+            return Err(error.into());
+        }
         tui::run(&mut app).await
     } else {
         run_headless(&mut app).await
@@ -56,6 +60,41 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     result?;
     shutdown_result?;
     Ok(())
+}
+
+async fn connect_before_tui(app: &mut TradingApp) -> Result<(), options_trading::AppError> {
+    eprintln!("Conectando con IOL antes de abrir la interfaz...");
+    match app.connect().await {
+        Ok(()) => {
+            eprintln!("Conexión con IOL confirmada. Abriendo la interfaz...");
+            Ok(())
+        }
+        Err(error @ options_trading::AppError::Connection(_)) => {
+            let attempts = app.config.connection_retry_attempts;
+            let delay = Duration::from_secs(app.config.connection_retry_delay_secs);
+            let mut last_error = error;
+            for attempt in 1..=attempts {
+                eprintln!(
+                    "Conexión fallida. Reintento {attempt}/{attempts} en {} segundos: {last_error}",
+                    app.config.connection_retry_delay_secs
+                );
+                tokio::time::sleep(delay).await;
+                match app.connect().await {
+                    Ok(()) => {
+                        eprintln!("Conexión con IOL confirmada. Abriendo la interfaz...");
+                        return Ok(());
+                    }
+                    Err(error @ options_trading::AppError::Connection(_)) => last_error = error,
+                    Err(error) => return Err(error),
+                }
+            }
+            app.mark_connection_not_operational(attempts, &last_error)?;
+            Err(options_trading::AppError::Connection(format!(
+                "NO OPERATIVO: no se pudo establecer conexión con IOL después de {attempts} reintentos. La TUI no se abrirá. Último error: {last_error}"
+            )))
+        }
+        Err(error) => Err(error),
+    }
 }
 
 enum UtilityCommand {

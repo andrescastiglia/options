@@ -35,7 +35,9 @@ El comando imprime un único texto Base64 y termina. Copialo manualmente en `IOL
 cargo run
 ```
 
-En una terminal interactiva se abre la TUI. En CI, pipes o con `TUI_ENABLED=false`, se ejecuta en modo headless.
+En una terminal interactiva, la TUI se abre únicamente después de confirmar la conexión inicial con IOL. Si ese preflight falla, los reintentos se informan en la terminal y la TUI no aparece. En CI, pipes o con `TUI_ENABLED=false`, se ejecuta en modo headless.
+
+Si la conexión REST se pierde mientras la TUI está abierta, el motor espera `CONNECTION_RETRY_DELAY_SECS` entre intentos y prueba hasta `CONNECTION_RETRY_ATTEMPTS` veces. Si no se recupera, detiene nuevas operaciones, activa el freno operativo y mantiene una alerta roja `NO OPERATIVO` en pantalla para que el operador revise IOL manualmente.
 
 Controles de la TUI:
 
@@ -105,6 +107,8 @@ Al iniciar, los costos configurados en variables de entorno son el fallback. Des
 | `MODE` | `readonly` | `readonly` o `live` |
 | `TICKER` | `GGAL` | Símbolo subyacente de BCBA |
 | `TUI_ENABLED` | `true` | Habilitar interfaz interactiva |
+| `CONNECTION_RETRY_ATTEMPTS` | `3` | Reintentos antes de declarar el motor no operativo |
+| `CONNECTION_RETRY_DELAY_SECS` | `5` | Espera fija entre reintentos de conexión |
 | `CHECK_INTERVAL_SECS` | `1` | Intervalo del motor |
 | `MIN_SAMPLES_FOR_TREND` | `30` | Confirmación consecutiva de una señal robusta |
 | `TREND_CHANGE_SAMPLES` | `5` | Confirmaciones robustas para reversión |

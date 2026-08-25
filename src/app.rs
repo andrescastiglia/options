@@ -115,6 +115,7 @@ pub struct TradingApp {
     pub account_profile: Option<AccountProfile>,
     pub cost_calibration: Option<CostCalibration>,
     pub realtime_status: String,
+    pub connection_operational: bool,
     pub last_movement: Option<AccountMovement>,
     pub live_stage: LiveStage,
     pub learning_state: LearningState,
@@ -364,6 +365,7 @@ impl TradingApp {
             account_profile: None,
             cost_calibration,
             realtime_status,
+            connection_operational: matches!(source, MarketSource::Replay(_)),
             last_movement: None,
             live_stage,
             learning_state,
@@ -533,14 +535,51 @@ impl TradingApp {
         Ok(true)
     }
 
+    /// Completa el preflight de IOL antes de que la interfaz tome control de la terminal.
+    pub async fn connect(&mut self) -> Result<(), AppError> {
+        self.initialize_iol_context().await
+    }
+
+    pub fn mark_connection_retry(&mut self, attempt: u32, total: u32, error: &AppError) {
+        self.realtime_status =
+            format!("Reconectando con IOL: intento {attempt} de {total} después de: {error}");
+        self.status = "Esperando que IOL vuelva a estar disponible".into();
+        self.push_log(self.realtime_status.clone());
+    }
+
+    pub fn mark_connection_restored(&mut self) {
+        self.connection_operational = true;
+        self.realtime_status = "Conexión operativa con IOL".into();
+        self.push_log("La conexión con IOL se restableció; el motor vuelve a operar".into());
+    }
+
+    pub fn mark_connection_not_operational(
+        &mut self,
+        attempts: u32,
+        error: &AppError,
+    ) -> Result<(), AppError> {
+        self.connection_operational = false;
+        self.paused = true;
+        self.risk.engage_operational_halt(format!(
+            "conexión con IOL agotada después de {attempts} reintentos: {error}"
+        ));
+        self.engine.halt();
+        self.realtime_status = "NO OPERATIVO · SIN CONEXIÓN CON IOL".into();
+        self.status = format!(
+            "NO OPERATIVO: se perdió la conexión con IOL después de {attempts} reintentos. No se procesan precios ni órdenes. Si hay una posición, revísela manualmente en IOL. Último error: {error}"
+        );
+        self.push_log(self.status.clone());
+        self.snapshot()
+    }
+
     async fn next_frame(&mut self) -> Result<Option<MarketFrame>, AppError> {
         match &mut self.source {
             MarketSource::Replay(market) => market.next_frame(),
             MarketSource::Iol(client) => client
-                .market_frame_with_retry(&self.config.ticker, 3)
+                .market_frame_with_retry(&self.config.ticker, 1)
                 .await
                 .map(Some)
-                .map_err(|error| AppError::External(error.to_string())),
+                .map_err(|error| AppError::Connection(error.to_string())),
         }
     }
 
@@ -821,9 +860,8 @@ impl TradingApp {
         if self.startup_reconciled {
             return Ok(());
         }
-        self.startup_reconciled = true;
-
         if !self.local_pending_orders.is_empty() && self.config.mode == Mode::Readonly {
+            self.startup_reconciled = true;
             return self.block_reconciliation(
                 timestamp,
                 format!(
@@ -842,6 +880,7 @@ impl TradingApp {
         }
 
         if self.config.mode == Mode::Readonly {
+            self.startup_reconciled = true;
             self.push_log("La información guardada fue revisada y está en orden".into());
             return Ok(());
         }
@@ -849,17 +888,20 @@ impl TradingApp {
         let account_result = match &mut self.source {
             MarketSource::Iol(client) => client.account_snapshot().await,
             MarketSource::Replay(_) => {
+                self.startup_reconciled = true;
                 self.real_account_clear = true;
                 self.push_log("Replay aislado: no se consultó ni se operará una cuenta IOL".into());
                 return Ok(());
             }
         };
         match account_result {
-            Ok(account) => self.apply_account_snapshot(timestamp, account),
-            Err(error) => self.block_reconciliation(
-                timestamp,
-                format!("no se pudo consultar cartera/ordenes IOL: {error}"),
-            ),
+            Ok(account) => {
+                self.startup_reconciled = true;
+                self.apply_account_snapshot(timestamp, account)
+            }
+            Err(error) => Err(AppError::Connection(format!(
+                "no se pudo consultar cartera/órdenes IOL: {error}"
+            ))),
         }
     }
 
@@ -1498,6 +1540,8 @@ impl TradingApp {
             .as_ref()
             .map_or_else(unix_now, |frame| frame.underlying.timestamp_secs);
         let clean = requested_clean
+            && self.connection_operational
+            && !self.risk.state.kill_switch
             && self.engine.position.is_none()
             && !self.reconciliation_blocked
             && self.local_pending_orders.is_empty();
@@ -1530,14 +1574,20 @@ impl TradingApp {
         if self.startup_context_loaded {
             return Ok(());
         }
-        self.startup_context_loaded = true;
         let context = match &mut self.source {
-            MarketSource::Replay(_) => return Ok(()),
+            MarketSource::Replay(_) => {
+                self.startup_context_loaded = true;
+                self.connection_operational = true;
+                return Ok(());
+            }
             MarketSource::Iol(client) => client
                 .startup_context()
                 .await
-                .map_err(|error| AppError::External(error.to_string()))?,
+                .map_err(|error| AppError::Connection(error.to_string()))?,
         };
+        self.startup_context_loaded = true;
+        self.connection_operational = true;
+        self.realtime_status = "Conexión inicial con IOL confirmada".into();
         if let Some(profile) = context.profile {
             self.push_log(format!(
                 "cuenta IOL {} · {}",
@@ -2022,7 +2072,7 @@ impl TradingApp {
             MarketSource::Iol(client) => client
                 .account_snapshot()
                 .await
-                .map_err(|error| AppError::External(error.to_string()))?,
+                .map_err(|error| AppError::Connection(error.to_string()))?,
             MarketSource::Replay(_) => return Ok(()),
         };
         self.last_account_reconciliation_secs = timestamp;
@@ -2505,6 +2555,8 @@ mod tests {
                 .join(format!("options-app-test-{}-{unique}", std::process::id())),
             replay_path: None,
             capture_market_data: false,
+            connection_retry_attempts: 3,
+            connection_retry_delay_secs: 1,
             max_investment_amount: 100_000.0,
             max_loss_per_trade: 5_000.0,
             max_daily_loss: 10_000.0,
@@ -2574,6 +2626,23 @@ mod tests {
         }
         assert_eq!(app.metrics().trades, 0);
         assert_eq!(app.engine.state, TradingState::Halted);
+    }
+
+    #[test]
+    fn exhausted_connection_retries_make_the_engine_clearly_inoperative() {
+        let mut app = TradingApp::new(replay_config()).unwrap();
+        app.connection_operational = true;
+        let error = AppError::Connection("timeout".into());
+
+        app.mark_connection_not_operational(3, &error).unwrap();
+
+        assert!(!app.connection_operational);
+        assert!(app.paused);
+        assert!(app.risk.state.kill_switch);
+        assert_eq!(app.engine.state, TradingState::Halted);
+        assert!(app.status.contains("NO OPERATIVO"));
+        assert!(app.status.contains("3 reintentos"));
+        assert!(app.status.contains("manualmente en IOL"));
     }
 
     #[tokio::test]

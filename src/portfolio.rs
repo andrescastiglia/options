@@ -104,6 +104,8 @@ mod tests {
             contracts: 1,
             contract_multiplier: 1,
             opened_at_secs: 1,
+            economics: None,
+            entry_context: None,
         }
     }
 

@@ -107,8 +107,17 @@ fn draw(frame: &mut Frame, app: &TradingApp) {
 
     let mode_color = match (app.config.mode, app.live_stage) {
         (crate::config::Mode::Readonly, crate::learning::LiveStage::Learning) => Color::Yellow,
-        (crate::config::Mode::Readonly, crate::learning::LiveStage::Live) => Color::Cyan,
+        (
+            crate::config::Mode::Readonly,
+            crate::learning::LiveStage::Eligible
+            | crate::learning::LiveStage::Armed
+            | crate::learning::LiveStage::Canary
+            | crate::learning::LiveStage::Live,
+        ) => Color::Cyan,
         (crate::config::Mode::Live, crate::learning::LiveStage::Learning) => Color::Yellow,
+        (crate::config::Mode::Live, crate::learning::LiveStage::Eligible) => Color::LightYellow,
+        (crate::config::Mode::Live, crate::learning::LiveStage::Armed) => Color::LightMagenta,
+        (crate::config::Mode::Live, crate::learning::LiveStage::Canary) => Color::LightRed,
         (crate::config::Mode::Live, crate::learning::LiveStage::Live) => Color::Red,
     };
     let account = app.account_profile.as_ref().map_or_else(
@@ -852,11 +861,29 @@ fn mode_name(mode: crate::config::Mode, live_stage: crate::learning::LiveStage) 
         (crate::config::Mode::Readonly, crate::learning::LiveStage::Learning) => {
             "READONLY · LEARNING (SIN ÓRDENES)"
         }
+        (crate::config::Mode::Readonly, crate::learning::LiveStage::Eligible) => {
+            "READONLY · ELEGIBLE (SÓLO AVISA)"
+        }
+        (crate::config::Mode::Readonly, crate::learning::LiveStage::Armed) => {
+            "READONLY · ARMED INACTIVO (SIN ÓRDENES)"
+        }
+        (crate::config::Mode::Readonly, crate::learning::LiveStage::Canary) => {
+            "READONLY · CANARY INACTIVO (SIN ÓRDENES)"
+        }
         (crate::config::Mode::Readonly, crate::learning::LiveStage::Live) => {
             "READONLY · LIVE (SÓLO AVISA)"
         }
         (crate::config::Mode::Live, crate::learning::LiveStage::Learning) => {
             "LIVE · APRENDIZAJE (DINERO SIMULADO)"
+        }
+        (crate::config::Mode::Live, crate::learning::LiveStage::Eligible) => {
+            "LIVE · ELEGIBLE (ESPERA AUTORIZACIÓN)"
+        }
+        (crate::config::Mode::Live, crate::learning::LiveStage::Armed) => {
+            "LIVE · ARMED (PREFLIGHT)"
+        }
+        (crate::config::Mode::Live, crate::learning::LiveStage::Canary) => {
+            "LIVE · CANARY (DINERO REAL LIMITADO)"
         }
         (crate::config::Mode::Live, crate::learning::LiveStage::Live) => {
             "LIVE · OPERACIÓN (DINERO REAL)"

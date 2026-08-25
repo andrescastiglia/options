@@ -1,14 +1,21 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
+use crate::learning_model::{assess_meta_filter, MetaFilterAssessment};
 use crate::trading::PositionKind;
+
+pub const EVIDENCE_SCHEMA_VERSION: u32 = 1;
+pub const AUTHORIZATION_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LiveStage {
     #[default]
     Learning,
+    Eligible,
+    Armed,
+    Canary,
     #[serde(alias = "trading")]
     Live,
 }
@@ -19,6 +26,40 @@ pub struct ValidationTrade {
     pub net_pnl: f64,
     pub stressed_net_pnl: f64,
     pub closed_at_secs: i64,
+    #[serde(default)]
+    pub context: ValidationContext,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceSource {
+    HistoricalOutOfSample,
+    #[default]
+    Shadow,
+    Canary,
+    Live,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ValidationContext {
+    pub trade_id: String,
+    pub source: EvidenceSource,
+    pub option_symbol: String,
+    pub opened_at_secs: i64,
+    pub entry_price: f64,
+    pub exit_price: f64,
+    pub contracts: u32,
+    pub max_net_loss: f64,
+    pub r_multiple: f64,
+    pub stressed_r_multiple: f64,
+    pub entry_spread_percentage: Option<f64>,
+    pub option_volume: Option<u64>,
+    pub days_to_expiry: Option<i64>,
+    pub moneyness_distance_percentage: Option<f64>,
+    pub trend_confidence: Option<f64>,
+    pub trend_r_squared: Option<f64>,
+    pub trend_slope_percent_per_minute: Option<f64>,
+    pub exit_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -52,8 +93,17 @@ impl LearningState {
         self.approved = false;
     }
 
-    pub fn record(&mut self, trade: ValidationTrade) {
+    pub fn record(&mut self, trade: ValidationTrade) -> bool {
+        if !trade.context.trade_id.is_empty()
+            && self
+                .trades
+                .iter()
+                .any(|existing| existing.context.trade_id == trade.context.trade_id)
+        {
+            return false;
+        }
         self.trades.push(trade);
+        true
     }
 
     pub fn report(&self, requirements: GateRequirements) -> LearningReport {
@@ -66,7 +116,7 @@ impl LearningState {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct GateRequirements {
     pub min_trades: u64,
     pub min_call_trades: u64,
@@ -75,6 +125,61 @@ pub struct GateRequirements {
     pub min_profit_factor: f64,
     pub max_daily_drawdown: f64,
     pub max_total_drawdown: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StrategyManifest {
+    pub schema_version: u32,
+    pub fingerprint: String,
+    pub build_hash: String,
+    pub package_version: String,
+    pub parameters: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EvidenceBundle {
+    pub schema_version: u32,
+    pub manifest: StrategyManifest,
+    pub gate_policy: GateRequirements,
+    pub learning_state: LearningState,
+    pub report: LearningReport,
+    #[serde(default)]
+    pub dataset_ids: Vec<String>,
+    pub updated_at_secs: i64,
+}
+
+impl EvidenceBundle {
+    pub fn is_compatible(&self, manifest: &StrategyManifest, gate: GateRequirements) -> bool {
+        self.schema_version == EVIDENCE_SCHEMA_VERSION
+            && self.manifest == *manifest
+            && self.gate_policy == gate
+            && self.learning_state.strategy_fingerprint == manifest.fingerprint
+            && self.report.strategy_fingerprint == manifest.fingerprint
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AuthorizationRequest {
+    pub schema_version: u32,
+    pub account_number: String,
+    pub epoch: u64,
+    pub strategy_fingerprint: String,
+    pub build_hash: String,
+    pub report_sha256: String,
+    pub canary_max_position_size: u32,
+    pub canary_max_investment_amount: f64,
+    pub canary_max_loss_per_trade: f64,
+    pub canary_max_daily_loss: f64,
+    pub generated_at_secs: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExecutionAuthorization {
+    pub schema_version: u32,
+    pub request: AuthorizationRequest,
+    pub issued_at_secs: i64,
+    pub expires_at_secs: i64,
+    pub confirmation: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -98,6 +203,20 @@ pub struct LearningReport {
     pub max_drawdown: f64,
     pub max_daily_drawdown: f64,
     pub stressed_net_pnl: f64,
+    #[serde(default)]
+    pub call_stressed_net_pnl: f64,
+    #[serde(default)]
+    pub put_stressed_net_pnl: f64,
+    #[serde(default)]
+    pub expectancy_r: f64,
+    #[serde(default)]
+    pub call_expectancy_r_lower_95: f64,
+    #[serde(default)]
+    pub put_expectancy_r_lower_95: f64,
+    #[serde(default)]
+    pub blocking_reasons: Vec<String>,
+    #[serde(default)]
+    pub meta_filter: MetaFilterAssessment,
     pub eligible: bool,
 }
 
@@ -137,30 +256,100 @@ impl LearningReport {
         let call_profit_factor = profit_factor(calls.iter().map(|trade| trade.net_pnl));
         let put_profit_factor = profit_factor(puts.iter().map(|trade| trade.net_pnl));
         let expectancy = mean(trades.iter().map(|trade| trade.net_pnl));
-        let call_lower =
-            bootstrap_lower_95(&calls.iter().map(|trade| trade.net_pnl).collect::<Vec<_>>());
-        let put_lower =
-            bootstrap_lower_95(&puts.iter().map(|trade| trade.net_pnl).collect::<Vec<_>>());
+        let call_lower = block_bootstrap_lower_95(&calls, |trade| trade.net_pnl);
+        let put_lower = block_bootstrap_lower_95(&puts, |trade| trade.net_pnl);
+        let expectancy_r = mean(trades.iter().map(r_multiple));
+        let call_r_lower = block_bootstrap_lower_95(&calls, |trade| r_multiple(trade));
+        let put_r_lower = block_bootstrap_lower_95(&puts, |trade| r_multiple(trade));
         let max_drawdown = max_drawdown(trades.iter().map(|trade| trade.net_pnl));
         let max_daily_drawdown = max_daily_drawdown(trades);
-        let eligible = trades.len() as u64 >= requirements.min_trades
-            && calls.len() as u64 >= requirements.min_call_trades
-            && puts.len() as u64 >= requirements.min_put_trades
-            && sessions >= requirements.min_sessions
-            && net_pnl > 0.0
-            && call_net_pnl > 0.0
-            && put_net_pnl > 0.0
-            && aggregate_profit_factor >= requirements.min_profit_factor
-            && call_profit_factor >= requirements.min_profit_factor
-            && put_profit_factor >= requirements.min_profit_factor
-            && expectancy > 0.0
-            && call_lower > 0.0
-            && put_lower > 0.0
-            && max_drawdown <= requirements.max_total_drawdown
-            && max_daily_drawdown <= requirements.max_daily_drawdown
-            && stressed_net_pnl > 0.0
-            && call_stressed > 0.0
-            && put_stressed > 0.0;
+        let mut blocking_reasons = Vec::new();
+        require(
+            trades.len() as u64 >= requirements.min_trades,
+            "min_trades",
+            &mut blocking_reasons,
+        );
+        require(
+            calls.len() as u64 >= requirements.min_call_trades,
+            "min_call_trades",
+            &mut blocking_reasons,
+        );
+        require(
+            puts.len() as u64 >= requirements.min_put_trades,
+            "min_put_trades",
+            &mut blocking_reasons,
+        );
+        require(
+            sessions >= requirements.min_sessions,
+            "min_sessions",
+            &mut blocking_reasons,
+        );
+        require(net_pnl > 0.0, "net_pnl", &mut blocking_reasons);
+        require(call_net_pnl > 0.0, "call_net_pnl", &mut blocking_reasons);
+        require(put_net_pnl > 0.0, "put_net_pnl", &mut blocking_reasons);
+        require(
+            aggregate_profit_factor >= requirements.min_profit_factor,
+            "profit_factor",
+            &mut blocking_reasons,
+        );
+        require(
+            call_profit_factor >= requirements.min_profit_factor,
+            "call_profit_factor",
+            &mut blocking_reasons,
+        );
+        require(
+            put_profit_factor >= requirements.min_profit_factor,
+            "put_profit_factor",
+            &mut blocking_reasons,
+        );
+        require(expectancy > 0.0, "expectancy", &mut blocking_reasons);
+        require(
+            call_lower > 0.0,
+            "call_expectancy_lower_95",
+            &mut blocking_reasons,
+        );
+        require(
+            put_lower > 0.0,
+            "put_expectancy_lower_95",
+            &mut blocking_reasons,
+        );
+        require(
+            call_r_lower > 0.0,
+            "call_expectancy_r_lower_95",
+            &mut blocking_reasons,
+        );
+        require(
+            put_r_lower > 0.0,
+            "put_expectancy_r_lower_95",
+            &mut blocking_reasons,
+        );
+        require(
+            max_drawdown <= requirements.max_total_drawdown,
+            "max_drawdown",
+            &mut blocking_reasons,
+        );
+        require(
+            max_daily_drawdown <= requirements.max_daily_drawdown,
+            "max_daily_drawdown",
+            &mut blocking_reasons,
+        );
+        require(
+            stressed_net_pnl > 0.0,
+            "stressed_net_pnl",
+            &mut blocking_reasons,
+        );
+        require(
+            call_stressed > 0.0,
+            "call_stressed_net_pnl",
+            &mut blocking_reasons,
+        );
+        require(
+            put_stressed > 0.0,
+            "put_stressed_net_pnl",
+            &mut blocking_reasons,
+        );
+        let eligible = blocking_reasons.is_empty();
+        let meta_filter = assess_meta_filter(trades);
         Self {
             epoch,
             strategy_fingerprint: fingerprint.to_string(),
@@ -181,6 +370,13 @@ impl LearningReport {
             max_drawdown,
             max_daily_drawdown,
             stressed_net_pnl,
+            call_stressed_net_pnl: call_stressed,
+            put_stressed_net_pnl: put_stressed,
+            expectancy_r,
+            call_expectancy_r_lower_95: call_r_lower,
+            put_expectancy_r_lower_95: put_r_lower,
+            blocking_reasons,
+            meta_filter,
             eligible,
         }
     }
@@ -272,24 +468,59 @@ fn max_daily_drawdown(trades: &[ValidationTrade]) -> f64 {
     worst
 }
 
-fn bootstrap_lower_95(values: &[f64]) -> f64 {
-    if values.len() < 2 {
-        return f64::NEG_INFINITY;
+fn block_bootstrap_lower_95<T>(trades: &[T], value: impl Fn(&T) -> f64) -> f64
+where
+    T: AsRef<ValidationTrade>,
+{
+    let mut blocks = BTreeMap::<i64, Vec<f64>>::new();
+    for item in trades {
+        let trade = item.as_ref();
+        blocks
+            .entry(argentina_day(trade.closed_at_secs))
+            .or_default()
+            .push(value(item));
     }
-    let mut state = 0x9e37_79b9_7f4a_7c15_u64 ^ values.len() as u64;
+    let blocks = blocks.into_values().collect::<Vec<_>>();
+    if blocks.len() < 2 {
+        return -f64::MAX;
+    }
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64 ^ blocks.len() as u64;
     let mut means = Vec::with_capacity(1_000);
     for _ in 0..1_000 {
         let mut total = 0.0;
-        for _ in values {
+        let mut observations = 0_u64;
+        for _ in &blocks {
             state = state
                 .wrapping_mul(6_364_136_223_846_793_005)
                 .wrapping_add(1);
-            total += values[(state as usize) % values.len()];
+            let block = &blocks[(state as usize) % blocks.len()];
+            total += block.iter().sum::<f64>();
+            observations += block.len() as u64;
         }
-        means.push(total / values.len() as f64);
+        means.push(total / observations.max(1) as f64);
     }
     means.sort_by(f64::total_cmp);
     means[24]
+}
+
+impl AsRef<ValidationTrade> for ValidationTrade {
+    fn as_ref(&self) -> &ValidationTrade {
+        self
+    }
+}
+
+fn r_multiple(trade: &ValidationTrade) -> f64 {
+    if trade.context.max_net_loss.is_finite() && trade.context.max_net_loss > 0.0 {
+        trade.net_pnl / trade.context.max_net_loss
+    } else {
+        trade.net_pnl
+    }
+}
+
+fn require(condition: bool, reason: &str, reasons: &mut Vec<String>) {
+    if !condition {
+        reasons.push(reason.to_string());
+    }
 }
 
 #[cfg(test)]
@@ -307,6 +538,7 @@ mod tests {
                     net_pnl: 10.0,
                     stressed_net_pnl: 5.0,
                     closed_at_secs: day * 86_400,
+                    context: ValidationContext::default(),
                 })
                 .collect(),
             approved: false,
@@ -331,6 +563,7 @@ mod tests {
                 net_pnl: -1.0,
                 stressed_net_pnl: -2.0,
                 closed_at_secs: timestamp,
+                context: ValidationContext::default(),
             })
             .collect::<Vec<_>>();
         assert!(trading_regressed(&trades, 30, 3, 100.0));
@@ -348,6 +581,7 @@ mod tests {
                 net_pnl: 10.0,
                 stressed_net_pnl: 5.0,
                 closed_at_secs: day * 86_400,
+                context: ValidationContext::default(),
             })
             .collect();
         let report = LearningState {

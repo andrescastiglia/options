@@ -37,6 +37,19 @@ pub struct Position {
     pub opened_at_secs: i64,
     #[serde(default)]
     pub economics: Option<PositionEconomics>,
+    #[serde(default)]
+    pub entry_context: Option<EntryContext>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct EntryContext {
+    pub spread_percentage: Option<f64>,
+    pub option_volume: u64,
+    pub days_to_expiry: u32,
+    pub moneyness_distance_percentage: f64,
+    pub trend_confidence: f64,
+    pub trend_r_squared: Option<f64>,
+    pub trend_slope_percent_per_minute: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -395,6 +408,7 @@ mod tests {
             contract_multiplier: 1,
             opened_at_secs,
             economics: None,
+            entry_context: None,
         }
     }
 

@@ -473,7 +473,7 @@ zeroize = "1"  # Para seguridad de credenciales
 - [x] Monitoreo local mediante TUI y tracing
 - [x] Documentación de operación local y gates live
 
-Estado de producción: sólo existen `readonly` y `live`. Ambos comienzan en Learning y pasan automáticamente a la etapa Live al aprobar los criterios de [`plan.md`](plan.md). Readonly continúa simulando y sólo avisa; live puede enviar órdenes reales si además cuenta con confirmación explícita, ruta verificada y cuenta reconciliada. Respuestas pendientes o parciales detienen el motor.
+Estado de producción: sólo existen `readonly` y `live`. El estado persistente sigue `Learning → Eligible → Armed → Canary → Live`; readonly se detiene en Eligible. Live requiere autorización efímera consumible, ruta verificada y cuenta reconciliada. Respuestas pendientes, parciales o ambiguas detienen el motor.
 
 ---
 

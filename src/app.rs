@@ -1,5 +1,6 @@
 use std::{
-    collections::HashMap, collections::VecDeque, env, fs::OpenOptions, io::Write, path::PathBuf,
+    collections::BTreeMap, collections::BTreeSet, collections::HashMap, collections::VecDeque, env,
+    fs::OpenOptions, io::Write, path::Path, path::PathBuf,
 };
 
 use crate::{
@@ -7,13 +8,16 @@ use crate::{
         AccountPosition, AccountSnapshot, BrokerClient, OrderExecution, OrderRequest, OrderSide,
         OrderStatus, PaperBroker,
     },
-    config::{Config, Mode},
+    config::{Config, Mode, LIVE_CONFIRMATION},
     errors::AppError,
     iol_client::{AccountMovement, AccountProfile, CostCalibration, IolClient, IolRealtimeEvent},
     learning::{
-        trading_regressed, GateRequirements, LearningReport, LearningState, LiveStage,
-        ValidationTrade,
+        trading_regressed, AuthorizationRequest, EvidenceBundle, EvidenceSource,
+        ExecutionAuthorization, GateRequirements, LearningReport, LearningState, LiveStage,
+        StrategyManifest, ValidationContext, ValidationTrade, AUTHORIZATION_SCHEMA_VERSION,
+        EVIDENCE_SCHEMA_VERSION,
     },
+    learning_model::SignalFeatures,
     market::{
         select_option_with_criteria, MarketDataProvider, MarketFrame, OptionKind,
         OptionSelectionCriteria, ReplayMarket,
@@ -28,13 +32,66 @@ use crate::{
     risk::{RiskLimits, RiskManager},
     trading::{
         build_position_economics, calculate_pnl_with_contract_multiplier, calculate_position_pnl,
-        ExitReason, Pnl, Position, PositionKind, TradingEngine,
+        EntryContext, ExitReason, Pnl, Position, PositionKind, TradingEngine,
     },
 };
 
 enum MarketSource {
     Replay(ReplayMarket),
     Iol(Box<IolClient>),
+}
+
+struct InstanceLease {
+    path: PathBuf,
+}
+
+impl InstanceLease {
+    fn acquire(path: PathBuf) -> Result<Self, AppError> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        match OpenOptions::new().create_new(true).write(true).open(&path) {
+            Ok(mut file) => {
+                writeln!(file, "{}", std::process::id())?;
+                file.sync_all()?;
+                Ok(Self { path })
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let owner = std::fs::read_to_string(&path).unwrap_or_default();
+                let active = owner
+                    .trim()
+                    .parse::<u32>()
+                    .ok()
+                    .is_some_and(process_is_active);
+                if active {
+                    Err(AppError::Recovery(format!(
+                        "ya existe una instancia activa para este modo (PID {})",
+                        owner.trim()
+                    )))
+                } else {
+                    std::fs::remove_file(&path)?;
+                    Self::acquire(path)
+                }
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn process_is_active(pid: u32) -> bool {
+    PathBuf::from(format!("/proc/{pid}")).exists()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_is_active(_pid: u32) -> bool {
+    true
+}
+
+impl Drop for InstanceLease {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 pub(crate) struct LogEntry {
@@ -78,14 +135,22 @@ pub struct TradingApp {
     return_to_learning_pending: bool,
     cooldown_until_secs: i64,
     learning_report_path: PathBuf,
+    evidence_bundle_path: PathBuf,
+    strategy_manifest: StrategyManifest,
+    authorization_request_path: PathBuf,
     real_account_clear: bool,
     last_account_reconciliation_secs: i64,
+    dataset_ids: Vec<String>,
+    _instance_lease: InstanceLease,
 }
 
 impl TradingApp {
     pub fn new(mut config: Config) -> Result<Self, AppError> {
+        let replay_path = config.replay_path.clone();
         let synthetic_test_source = cfg!(test) && config.iol_base_url == "https://example.invalid";
-        let mut source = if synthetic_test_source {
+        let mut source = if let Some(path) = &replay_path {
+            MarketSource::Replay(ReplayMarket::from_jsonl(path)?)
+        } else if synthetic_test_source {
             MarketSource::Replay(ReplayMarket::synthetic(&config.ticker))
         } else {
             let username = env::var("IOL_USERNAME")
@@ -104,14 +169,18 @@ impl TradingApp {
             .with_websocket_url(&config.iol_websocket_url);
             MarketSource::Iol(Box::new(client))
         };
+        let dataset_ids = replay_path
+            .as_ref()
+            .map(|path| dataset_id(path))
+            .transpose()?
+            .into_iter()
+            .collect();
 
         let mode_name = format!("{:?}", config.mode).to_ascii_lowercase();
+        let instance_lease =
+            InstanceLease::acquire(config.data_dir.join(&mode_name).join("instance.lock"))?;
         let journal_path = config.data_dir.join(&mode_name).join("journal.jsonl");
         let snapshot_path = config.data_dir.join(&mode_name).join("state.json");
-        let learning_report_path = config
-            .data_dir
-            .join(&mode_name)
-            .join("learning-eligibility.json");
         let mut journal = Journal::open(&journal_path)?;
         let mut engine = TradingEngine::new();
         let mut portfolio = Portfolio::default();
@@ -188,11 +257,21 @@ impl TradingApp {
             }
             let events = journal.events_after(snapshot.last_sequence)?;
             for event in &events {
-                apply_recovery_event(&mut engine, &mut portfolio, &mut risk, event)?;
+                apply_recovery_event(
+                    &mut engine,
+                    &mut portfolio,
+                    &mut risk,
+                    &mut learning_state,
+                    &mut trading_performance,
+                    event,
+                )?;
                 if let JournalEventKind::LiveStageChanged { to, .. } = event.event {
                     live_stage = to;
                 }
             }
+            learning_state.approved = learning_state
+                .report(gate_requirements_for_config(&config))
+                .eligible;
             // Los límites de riesgo vigentes siempre provienen de la configuración actual,
             // no de un snapshot potencialmente antiguo.
             risk.limits = configured_limits;
@@ -201,6 +280,53 @@ impl TradingApp {
                 integer(snapshot.last_sequence),
                 integer(events.len())
             ));
+        }
+
+        let strategy_manifest = strategy_manifest(&config);
+        fingerprint = strategy_manifest.fingerprint.clone();
+        if learning_state.strategy_fingerprint != fingerprint {
+            learning_state.reset(fingerprint.clone());
+            live_stage = LiveStage::Learning;
+            trading_performance.clear();
+            return_to_learning_pending = false;
+        }
+        let evidence_dir = config.data_dir.join("evidence").join(&fingerprint);
+        let learning_report_path = evidence_dir.join("learning-eligibility.json");
+        let evidence_bundle_path = evidence_dir.join("evidence-bundle.json");
+        let authorization_request_path = config
+            .data_dir
+            .join("live")
+            .join("live-authorization-request.json");
+        if config.recover_state && evidence_bundle_path.exists() {
+            match load_evidence_bundle(&evidence_bundle_path) {
+                Ok(bundle)
+                    if bundle.is_compatible(
+                        &strategy_manifest,
+                        gate_requirements_for_config(&config),
+                    ) =>
+                {
+                    let mut imported = 0_u64;
+                    for trade in bundle.learning_state.trades {
+                        imported += u64::from(learning_state.record(trade));
+                    }
+                    learning_state.approved = learning_state
+                        .report(gate_requirements_for_config(&config))
+                        .eligible;
+                    if imported > 0 {
+                        recovery_message = Some(format!(
+                            "se importaron {} operaciones compatibles del bundle de evidencia",
+                            integer(imported)
+                        ));
+                    }
+                }
+                Ok(_) => {
+                    recovery_message = Some(
+                        "el bundle de evidencia no coincide con estrategia, build o gate; se ignora"
+                            .into(),
+                    );
+                }
+                Err(error) => return Err(error),
+            }
         }
 
         let local_pending_orders = unresolved_local_orders(&read_events(&journal_path)?);
@@ -256,8 +382,13 @@ impl TradingApp {
             return_to_learning_pending,
             cooldown_until_secs,
             learning_report_path,
+            evidence_bundle_path,
+            strategy_manifest,
+            authorization_request_path,
             real_account_clear: false,
             last_account_reconciliation_secs: 0,
+            dataset_ids,
+            _instance_lease: instance_lease,
         };
         if let Some(message) = recovery_message {
             app.push_log(message);
@@ -270,8 +401,8 @@ impl TradingApp {
     }
 
     pub async fn step(&mut self) -> Result<bool, AppError> {
-        if self.paused || self.completed {
-            return Ok(!self.completed);
+        if self.completed {
+            return Ok(false);
         }
         self.initialize_iol_context().await?;
         self.sync_realtime_events();
@@ -285,10 +416,14 @@ impl TradingApp {
             }
         };
         frame.validate(self.last_market_timestamp)?;
+        if self.config.capture_market_data && !matches!(self.source, MarketSource::Replay(_)) {
+            capture_market_frame(&self.config, &frame)?;
+        }
         self.last_market_timestamp = Some(frame.underlying.timestamp_secs);
         self.ticks = self.ticks.saturating_add(1);
         let timestamp = frame.underlying.timestamp_secs;
         self.current_frame = Some(frame);
+        self.risk.rollover(timestamp);
         self.sync_realtime_events();
 
         self.reconcile_startup(timestamp).await?;
@@ -298,16 +433,16 @@ impl TradingApp {
         }
 
         if self.config.mode == Mode::Live
-            && (self.is_learning() || self.engine.position.is_none())
+            && matches!(self.source, MarketSource::Iol(_))
             && timestamp.saturating_sub(self.last_account_reconciliation_secs) >= 60
         {
-            self.refresh_live_account_clear(timestamp).await?;
+            self.refresh_live_account(timestamp).await?;
             if self.reconciliation_blocked {
                 self.snapshot()?;
                 return Ok(true);
             }
         }
-        if self.live_stage == LiveStage::Live
+        if self.live_stage != LiveStage::Learning
             && !self.return_to_learning_pending
             && !self.has_fresh_option_calibration(timestamp)
         {
@@ -318,7 +453,7 @@ impl TradingApp {
             self.apply_pending_learning_return(timestamp)?;
         }
         if self.config.mode == Mode::Live
-            && self.live_stage == LiveStage::Live
+            && matches!(self.live_stage, LiveStage::Canary | LiveStage::Live)
             && !self.return_to_learning_pending
             && !self.config.live_ordering_ready()
         {
@@ -385,7 +520,8 @@ impl TradingApp {
         }
         self.apply_pending_learning_return(timestamp)?;
         self.maybe_promote_live(timestamp).await?;
-        if self.engine.position.is_none()
+        if !self.paused
+            && self.engine.position.is_none()
             && trend.confirmed
             && !self.risk.state.kill_switch
             && timestamp >= self.cooldown_until_secs
@@ -414,7 +550,7 @@ impl TradingApp {
         direction: Direction,
     ) -> Result<(), AppError> {
         if self.is_real_trading() {
-            self.refresh_live_account_clear(timestamp).await?;
+            self.refresh_live_account(timestamp).await?;
             if !self.real_account_clear {
                 return Ok(());
             }
@@ -468,17 +604,58 @@ impl TradingApp {
             ));
             return Ok(());
         };
+        if self.live_stage != LiveStage::Learning {
+            let assessment = self
+                .learning_state
+                .report(self.gate_requirements())
+                .meta_filter;
+            if assessment.recommended {
+                if let (Some(model), Some(trend), Some(frame), Some(spread), Some(r_squared)) = (
+                    assessment.model,
+                    self.current_trend.as_ref(),
+                    self.current_frame.as_ref(),
+                    option.spread_percentage(),
+                    self.current_trend
+                        .as_ref()
+                        .and_then(|trend| trend.r_squared),
+                ) {
+                    let underlying = frame.underlying.last;
+                    let features = SignalFeatures([
+                        spread,
+                        option.volume as f64,
+                        option.expiry_days as f64,
+                        ((option.strike - underlying).abs() / underlying) * 100.0,
+                        trend.confidence,
+                        r_squared,
+                        trend.slope_percent_per_minute.abs(),
+                    ]);
+                    if !model.allows(features) {
+                        self.engine.resume();
+                        self.last_traded_signal = Some(direction);
+                        self.push_log(format!(
+                            "Meta-filtro rechazó {}: probabilidad {:.1}% bajo umbral {:.1}%",
+                            option.symbol,
+                            model.probability(features) * 100.0,
+                            model.threshold * 100.0
+                        ));
+                        return Ok(());
+                    }
+                }
+            }
+        }
         self.selected_option = Some(option.symbol.clone());
         let market_price = option
             .executable_buy_price()
             .ok_or_else(|| AppError::InvalidMarketData("ask de opcion ausente".into()))?;
         let limit_price = market_price * 1.005;
+        let (max_investment_amount, max_loss_per_trade, max_position_size) =
+            self.execution_risk_limits();
         let cash_quantity = affordable_contracts(
-            self.config.max_investment_amount,
+            max_investment_amount,
             limit_price,
             self.config.contract_multiplier,
             self.config.operating_cost_percentage(),
-            self.config.max_position_size,
+            max_position_size,
         );
         let risk_per_contract = build_position_economics(
             limit_price,
@@ -488,13 +665,13 @@ impl TradingApp {
             self.config.tax_percentage,
             self.execution_slippage_bps(),
             self.config.stop_loss_percentage,
-            self.config.max_loss_per_trade,
+            max_loss_per_trade,
             self.config.min_profit_multiplier,
             self.config.min_reward_risk_ratio,
         )
         .map_or(f64::INFINITY, |economics| economics.max_net_loss);
         let risk_quantity = if risk_per_contract.is_finite() && risk_per_contract > 0.0 {
-            (self.config.max_loss_per_trade / risk_per_contract)
+            (max_loss_per_trade / risk_per_contract)
                 .floor()
                 .clamp(0.0, u32::MAX as f64) as u32
         } else {
@@ -504,7 +681,7 @@ impl TradingApp {
         if quantity == 0 {
             let reason = format!(
                 "presupuesto {} insuficiente para un contrato de {}",
-                decimal(self.config.max_investment_amount, 2),
+                decimal(max_investment_amount, 2),
                 option.symbol
             );
             self.journal.append(
@@ -524,7 +701,7 @@ impl TradingApp {
             self.config.contract_multiplier,
             self.config.operating_cost_percentage(),
         );
-        if let Err(reason) = self.risk.allow_entry(maximum_cash) {
+        if let Err(reason) = self.risk.allow_entry_at(timestamp, maximum_cash) {
             self.journal.append(
                 timestamp,
                 None,
@@ -564,20 +741,49 @@ impl TradingApp {
             self.config.tax_percentage,
             self.execution_slippage_bps(),
             self.config.stop_loss_percentage,
-            self.config.max_loss_per_trade,
+            max_loss_per_trade,
             self.config.min_profit_multiplier,
             self.config.min_reward_risk_ratio,
         )
         .ok_or_else(|| AppError::OrderRejected("economía de posición inválida".into()))?;
         let position = Position {
             operation_id: operation_id.clone(),
-            option_symbol: option.symbol,
+            option_symbol: option.symbol.clone(),
             kind: PositionKind::from(option_kind),
             entry_price: fill_price,
             contracts: execution.filled_quantity,
             contract_multiplier: self.config.contract_multiplier,
             opened_at_secs: timestamp,
             economics: Some(economics),
+            entry_context: Some(EntryContext {
+                spread_percentage: option.spread_percentage(),
+                option_volume: option.volume,
+                days_to_expiry: option.expiry_days,
+                moneyness_distance_percentage: ((option.strike
+                    - self
+                        .current_frame
+                        .as_ref()
+                        .map_or(option.strike, |frame| frame.underlying.last))
+                .abs()
+                    / self
+                        .current_frame
+                        .as_ref()
+                        .map_or(option.strike, |frame| frame.underlying.last)
+                        .max(f64::EPSILON))
+                    * 100.0,
+                trend_confidence: self
+                    .current_trend
+                    .as_ref()
+                    .map_or(0.0, |trend| trend.confidence),
+                trend_r_squared: self
+                    .current_trend
+                    .as_ref()
+                    .and_then(|trend| trend.r_squared),
+                trend_slope_percent_per_minute: self
+                    .current_trend
+                    .as_ref()
+                    .map_or(0.0, |trend| trend.slope_percent_per_minute),
+            }),
         };
         self.journal.append(
             timestamp,
@@ -587,7 +793,8 @@ impl TradingApp {
             },
         )?;
         if !self.engine.open_position(position.clone()) || !self.portfolio.open(position.clone()) {
-            self.risk.engage_kill_switch();
+            self.risk
+                .engage_operational_halt("inconsistencia al registrar posicion ejecutada");
             self.engine.halt();
             return Err(AppError::Recovery(
                 "inconsistencia al registrar posicion ejecutada".into(),
@@ -641,7 +848,11 @@ impl TradingApp {
 
         let account_result = match &mut self.source {
             MarketSource::Iol(client) => client.account_snapshot().await,
-            MarketSource::Replay(_) => unreachable!("live siempre usa IOL"),
+            MarketSource::Replay(_) => {
+                self.real_account_clear = true;
+                self.push_log("Replay aislado: no se consultó ni se operará una cuenta IOL".into());
+                return Ok(());
+            }
         };
         match account_result {
             Ok(account) => self.apply_account_snapshot(timestamp, account),
@@ -707,6 +918,8 @@ impl TradingApp {
 
         match (self.engine.position.clone(), option_positions.first()) {
             (None, None) => {
+                self.real_account_clear = true;
+                self.last_account_reconciliation_secs = timestamp;
                 self.push_log("IOL confirma que no hay opciones ni órdenes activas".into());
                 Ok(())
             }
@@ -728,6 +941,8 @@ impl TradingApp {
                     );
                 }
                 self.engine.resume();
+                self.real_account_clear = false;
+                self.last_account_reconciliation_secs = timestamp;
                 self.push_log(format!(
                     "posicion {} x{} confirmada contra cartera IOL",
                     local.option_symbol,
@@ -792,6 +1007,7 @@ impl TradingApp {
                 self.config.min_profit_multiplier,
                 self.config.min_reward_risk_ratio,
             ),
+            entry_context: None,
         };
         self.journal.append(
             timestamp,
@@ -809,7 +1025,9 @@ impl TradingApp {
         self.selected_option = Some(position.option_symbol.clone());
         self.last_traded_signal = Some(position.direction());
         if position.notional() > self.config.max_investment_amount {
-            self.risk.engage_kill_switch();
+            self.risk.engage_operational_halt(
+                "la exposición recuperada supera el presupuesto configurado",
+            );
             self.push_log(format!(
                 "exposicion recuperada {} supera presupuesto {}; nuevas entradas bloqueadas",
                 decimal(position.notional(), 2),
@@ -828,7 +1046,8 @@ impl TradingApp {
 
     fn block_reconciliation(&mut self, timestamp: i64, reason: String) -> Result<(), AppError> {
         self.reconciliation_blocked = true;
-        self.risk.engage_kill_switch();
+        self.risk
+            .engage_operational_halt(format!("reconciliación bloqueada: {reason}"));
         self.engine.halt();
         self.status = format!("Detenido: los datos guardados no coinciden con IOL: {reason}");
         self.push_log(self.status.clone());
@@ -843,7 +1062,8 @@ impl TradingApp {
     }
 
     fn halt_for_market_risk(&mut self, timestamp: i64, reason: String) -> Result<(), AppError> {
-        self.risk.engage_kill_switch();
+        self.risk
+            .engage_operational_halt(format!("riesgo de mercado: {reason}"));
         self.engine.halt();
         self.status = format!("Detenido para evitar una operación insegura: {reason}");
         self.push_log(self.status.clone());
@@ -975,6 +1195,8 @@ impl TradingApp {
                 self.config.min_profit_multiplier,
             )
         };
+        let validation_trade =
+            self.build_validation_trade(&position, pnl, fill_price, timestamp, reason);
         self.journal.append(
             timestamp,
             Some(position.operation_id.clone()),
@@ -983,6 +1205,8 @@ impl TradingApp {
                 exit_price: fill_price,
                 net_pnl: pnl.net,
                 reason,
+                stage: self.live_stage,
+                validation_trade: Some(validation_trade.clone()),
             },
         )?;
         self.portfolio.close(
@@ -993,10 +1217,8 @@ impl TradingApp {
             reason,
         );
         self.engine.close(reason);
-        self.record_stage_trade(&position, pnl, fill_price, timestamp)?;
-        if !self.is_learning() {
-            self.risk.record_close(pnl.net);
-        }
+        self.record_stage_trade(validation_trade)?;
+        self.risk.record_close_at(timestamp, pnl.net);
         self.current_pnl = Some(pnl);
         let sell_message = if self.is_real_trading() {
             "Venta real enviada"
@@ -1042,13 +1264,67 @@ impl TradingApp {
             let MarketSource::Iol(client) = &mut self.source else {
                 return Err(AppError::External("cliente IOL no inicializado".into()));
             };
-            client
-                .submit_order(order_path, request)
-                .await
-                .map_err(|error| AppError::External(error.to_string()))?
+            match client.submit_order(order_path, request).await {
+                Ok(execution) => execution,
+                Err(error) => {
+                    let reason = error.to_string();
+                    self.journal.append(
+                        timestamp,
+                        Some(request.operation_id.clone()),
+                        JournalEventKind::OrderUnknown {
+                            request: request.clone(),
+                            reason: reason.clone(),
+                        },
+                    )?;
+                    self.journal.sync()?;
+                    if !self.local_pending_orders.contains(&request.operation_id) {
+                        self.local_pending_orders.push(request.operation_id.clone());
+                    }
+                    self.reconciliation_blocked = true;
+                    self.real_account_clear = false;
+                    self.risk.engage_operational_halt(format!(
+                        "resultado desconocido para la orden {}: {reason}",
+                        request.operation_id
+                    ));
+                    self.engine.halt();
+                    self.status = format!(
+                        "Orden {} sin confirmación; reconciliar manualmente con IOL",
+                        request.operation_id
+                    );
+                    return Err(AppError::External(format!(
+                        "orden enviada con resultado desconocido: {reason}"
+                    )));
+                }
+            }
         } else {
             self.paper_broker.submit_limit(request.clone())?
         };
+        if self.is_real_trading()
+            && execution.status == OrderStatus::Executed
+            && execution
+                .broker_order_id
+                .as_deref()
+                .is_none_or(str::is_empty)
+        {
+            let reason = "IOL informó ejecución sin broker_order_id".to_string();
+            self.journal.append(
+                timestamp,
+                Some(request.operation_id.clone()),
+                JournalEventKind::OrderUnknown {
+                    request: request.clone(),
+                    reason: reason.clone(),
+                },
+            )?;
+            self.journal.sync()?;
+            if !self.local_pending_orders.contains(&request.operation_id) {
+                self.local_pending_orders.push(request.operation_id.clone());
+            }
+            self.reconciliation_blocked = true;
+            self.real_account_clear = false;
+            self.risk.engage_operational_halt(&reason);
+            self.engine.halt();
+            return Err(AppError::Recovery(reason));
+        }
         self.journal.append(
             timestamp,
             Some(request.operation_id.clone()),
@@ -1070,7 +1346,8 @@ impl TradingApp {
                 OrderStatus::Pending | OrderStatus::PartiallyExecuted
             )
         {
-            self.risk.engage_kill_switch();
+            self.risk
+                .engage_operational_halt("orden real pendiente o parcialmente ejecutada");
             self.engine.halt();
             self.status =
                 "Una orden con dinero real quedó sin confirmar; revisarla manualmente en IOL"
@@ -1208,6 +1485,10 @@ impl TradingApp {
     }
 
     pub async fn shutdown(&mut self) -> Result<(), AppError> {
+        self.shutdown_with_status(true).await
+    }
+
+    pub async fn shutdown_with_status(&mut self, requested_clean: bool) -> Result<(), AppError> {
         self.refresh_iol_costs().await;
         if let MarketSource::Iol(client) = &mut self.source {
             client.shutdown().await;
@@ -1216,13 +1497,17 @@ impl TradingApp {
             .current_frame
             .as_ref()
             .map_or_else(unix_now, |frame| frame.underlying.timestamp_secs);
+        let clean = requested_clean
+            && self.engine.position.is_none()
+            && !self.reconciliation_blocked
+            && self.local_pending_orders.is_empty();
         self.journal.append(
             timestamp,
             self.engine
                 .position
                 .as_ref()
                 .map(|position| position.operation_id.clone()),
-            JournalEventKind::Shutdown { clean: true },
+            JournalEventKind::Shutdown { clean },
         )?;
         self.snapshot()?;
         self.journal.sync()
@@ -1321,6 +1606,7 @@ impl TradingApp {
                 );
             }
         }
+        self.refresh_strategy_identity();
         self.push_log(format!(
             "Costos calculados con la operación {} de IOL: total {}% ({} cargos)",
             calibration.operation_number,
@@ -1328,6 +1614,18 @@ impl TradingApp {
             integer(calibration.components.len())
         ));
         self.cost_calibration = Some(calibration);
+    }
+
+    fn refresh_strategy_identity(&mut self) {
+        let manifest = strategy_manifest(&self.config);
+        let evidence_dir = self
+            .config
+            .data_dir
+            .join("evidence")
+            .join(&manifest.fingerprint);
+        self.learning_report_path = evidence_dir.join("learning-eligibility.json");
+        self.evidence_bundle_path = evidence_dir.join("evidence-bundle.json");
+        self.strategy_manifest = manifest;
     }
 
     fn has_fresh_option_calibration(&self, now_secs: i64) -> bool {
@@ -1363,7 +1661,9 @@ impl TradingApp {
     }
 
     fn is_real_trading(&self) -> bool {
-        self.config.mode == Mode::Live && self.live_stage == LiveStage::Live
+        self.config.mode == Mode::Live
+            && matches!(self.live_stage, LiveStage::Canary | LiveStage::Live)
+            && matches!(self.source, MarketSource::Iol(_))
     }
 
     fn is_learning(&self) -> bool {
@@ -1378,42 +1678,103 @@ impl TradingApp {
         }
     }
 
-    fn gate_requirements(&self) -> GateRequirements {
-        GateRequirements {
-            min_trades: self.config.live_learning_min_trades,
-            min_call_trades: self.config.live_learning_min_call_trades,
-            min_put_trades: self.config.live_learning_min_put_trades,
-            min_sessions: self.config.live_learning_min_sessions,
-            min_profit_factor: self.config.live_learning_min_profit_factor,
-            max_daily_drawdown: self.config.max_daily_loss,
-            max_total_drawdown: self.config.max_daily_loss * 2.0,
+    fn execution_risk_limits(&self) -> (f64, f64, u32) {
+        if self.live_stage == LiveStage::Canary {
+            (
+                self.config.canary_max_investment_amount,
+                self.config.canary_max_loss_per_trade,
+                self.config.canary_max_position_size,
+            )
+        } else {
+            (
+                self.config.max_investment_amount,
+                self.config.max_loss_per_trade,
+                self.config.max_position_size,
+            )
         }
     }
 
-    fn record_stage_trade(
-        &mut self,
+    fn gate_requirements(&self) -> GateRequirements {
+        gate_requirements_for_config(&self.config)
+    }
+
+    fn build_validation_trade(
+        &self,
         position: &Position,
         pnl: Pnl,
         fill_price: f64,
         timestamp: i64,
-    ) -> Result<(), AppError> {
+        reason: ExitReason,
+    ) -> ValidationTrade {
         let units = position.contracts as f64 * position.contract_multiplier as f64;
         let additional_slippage = fill_price * units * (self.execution_slippage_bps() / 10_000.0);
-        let trade = ValidationTrade {
+        let stressed_net_pnl = pnl.net - pnl.commission - additional_slippage;
+        let max_net_loss = position
+            .economics
+            .map_or(self.config.max_loss_per_trade, |economics| {
+                economics.max_net_loss
+            });
+        ValidationTrade {
             kind: position.kind,
             net_pnl: pnl.net,
-            stressed_net_pnl: pnl.net - pnl.commission - additional_slippage,
+            stressed_net_pnl,
             closed_at_secs: timestamp,
-        };
+            context: ValidationContext {
+                trade_id: position.operation_id.clone(),
+                source: if matches!(self.source, MarketSource::Replay(_)) {
+                    EvidenceSource::HistoricalOutOfSample
+                } else {
+                    match self.live_stage {
+                        LiveStage::Learning | LiveStage::Eligible | LiveStage::Armed => {
+                            EvidenceSource::Shadow
+                        }
+                        LiveStage::Canary => EvidenceSource::Canary,
+                        LiveStage::Live => EvidenceSource::Live,
+                    }
+                },
+                option_symbol: position.option_symbol.clone(),
+                opened_at_secs: position.opened_at_secs,
+                entry_price: position.entry_price,
+                exit_price: fill_price,
+                contracts: position.contracts,
+                max_net_loss,
+                r_multiple: pnl.net / max_net_loss.max(f64::EPSILON),
+                stressed_r_multiple: stressed_net_pnl / max_net_loss.max(f64::EPSILON),
+                exit_reason: Some(format!("{reason:?}").to_ascii_lowercase()),
+                entry_spread_percentage: position
+                    .entry_context
+                    .and_then(|context| context.spread_percentage),
+                option_volume: position.entry_context.map(|context| context.option_volume),
+                days_to_expiry: position
+                    .entry_context
+                    .map(|context| i64::from(context.days_to_expiry)),
+                moneyness_distance_percentage: position
+                    .entry_context
+                    .map(|context| context.moneyness_distance_percentage),
+                trend_confidence: position
+                    .entry_context
+                    .map(|context| context.trend_confidence),
+                trend_r_squared: position
+                    .entry_context
+                    .and_then(|context| context.trend_r_squared),
+                trend_slope_percent_per_minute: position
+                    .entry_context
+                    .map(|context| context.trend_slope_percent_per_minute),
+            },
+        }
+    }
+
+    fn record_stage_trade(&mut self, trade: ValidationTrade) -> Result<(), AppError> {
         if self.live_stage == LiveStage::Learning {
             self.learning_state.record(trade);
             let report = self.learning_state.report(self.gate_requirements());
             self.learning_state.approved = report.eligible;
             self.save_learning_report(&report)?;
         } else {
+            let trade_net_pnl = trade.net_pnl;
             self.trading_performance.push(trade);
             let daily_loss_after_close =
-                self.risk.state.realized_pnl + pnl.net <= -self.config.max_daily_loss;
+                self.risk.state.realized_pnl + trade_net_pnl <= -self.config.max_daily_loss;
             if daily_loss_after_close
                 || trading_regressed(
                     &self.trading_performance,
@@ -1433,51 +1794,224 @@ impl TradingApp {
     }
 
     fn save_learning_report(&self, report: &LearningReport) -> Result<(), AppError> {
-        if let Some(parent) = self.learning_report_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let temporary = self.learning_report_path.with_extension("json.tmp");
-        let mut file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&temporary)?;
-        file.write_all(&serde_json::to_vec_pretty(report)?)?;
-        file.sync_all()?;
-        std::fs::rename(temporary, &self.learning_report_path)?;
+        write_json_atomic(&self.learning_report_path, report)?;
+        let bundle = EvidenceBundle {
+            schema_version: EVIDENCE_SCHEMA_VERSION,
+            manifest: self.strategy_manifest.clone(),
+            gate_policy: self.gate_requirements(),
+            learning_state: self.learning_state.clone(),
+            report: report.clone(),
+            dataset_ids: self.dataset_ids.clone(),
+            updated_at_secs: report.generated_at_secs,
+        };
+        write_json_atomic(&self.evidence_bundle_path, &bundle)?;
         Ok(())
     }
 
+    fn ensure_authorization_request(
+        &self,
+        timestamp: i64,
+    ) -> Result<Option<AuthorizationRequest>, AppError> {
+        let Some(profile) = &self.account_profile else {
+            return Ok(None);
+        };
+        let report = self.learning_state.report(self.gate_requirements());
+        let report_sha256 = digest_hex(&serde_json::to_vec(&report)?);
+        let mut desired = AuthorizationRequest {
+            schema_version: AUTHORIZATION_SCHEMA_VERSION,
+            account_number: profile.account_number.clone(),
+            epoch: self.learning_state.epoch,
+            strategy_fingerprint: self.strategy_manifest.fingerprint.clone(),
+            build_hash: self.strategy_manifest.build_hash.clone(),
+            report_sha256,
+            canary_max_position_size: self.config.canary_max_position_size,
+            canary_max_investment_amount: self.config.canary_max_investment_amount,
+            canary_max_loss_per_trade: self.config.canary_max_loss_per_trade,
+            canary_max_daily_loss: self.config.canary_max_daily_loss,
+            generated_at_secs: timestamp,
+        };
+        if self.authorization_request_path.exists() {
+            let existing: AuthorizationRequest =
+                serde_json::from_slice(&std::fs::read(&self.authorization_request_path)?)?;
+            desired.generated_at_secs = existing.generated_at_secs;
+            if existing == desired {
+                return Ok(Some(existing));
+            }
+            desired.generated_at_secs = timestamp;
+        }
+        write_json_atomic(&self.authorization_request_path, &desired)?;
+        Ok(Some(desired))
+    }
+
+    fn authorization_is_valid(
+        &self,
+        request: &AuthorizationRequest,
+        timestamp: i64,
+    ) -> Result<bool, AppError> {
+        if !self.config.live_ordering_ready() {
+            return Ok(false);
+        }
+        let Some(path) = self.config.live_authorization_path.as_deref() else {
+            return Ok(false);
+        };
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        let authorization: ExecutionAuthorization = serde_json::from_slice(&bytes)?;
+        let valid_lifetime = authorization.issued_at_secs <= timestamp
+            && authorization.expires_at_secs > timestamp
+            && authorization
+                .expires_at_secs
+                .saturating_sub(authorization.issued_at_secs)
+                <= 15 * 60;
+        Ok(authorization.schema_version == AUTHORIZATION_SCHEMA_VERSION
+            && authorization.request == *request
+            && authorization.confirmation == LIVE_CONFIRMATION
+            && valid_lifetime)
+    }
+
+    fn consume_authorization(&self, timestamp: i64) -> Result<(), AppError> {
+        let path = self
+            .config
+            .live_authorization_path
+            .as_deref()
+            .ok_or_else(|| AppError::External("LIVE_AUTHORIZATION_PATH ausente".into()))?;
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let consumed = parent.join(format!(
+            "live-authorization-consumed-epoch-{}-{timestamp}.json",
+            self.learning_state.epoch
+        ));
+        std::fs::rename(path, consumed)?;
+        Ok(())
+    }
+
+    fn canary_eligible(&self) -> bool {
+        let trades = self
+            .trading_performance
+            .iter()
+            .filter(|trade| trade.context.source == EvidenceSource::Canary)
+            .collect::<Vec<_>>();
+        let calls = trades
+            .iter()
+            .filter(|trade| trade.kind == PositionKind::Call)
+            .count() as u64;
+        let puts = trades
+            .iter()
+            .filter(|trade| trade.kind == PositionKind::Put)
+            .count() as u64;
+        let sessions = trades
+            .iter()
+            .map(|trade| argentina_day(trade.closed_at_secs))
+            .collect::<BTreeSet<_>>()
+            .len();
+        let stressed_total = trades
+            .iter()
+            .map(|trade| trade.stressed_net_pnl)
+            .sum::<f64>();
+        let stressed_calls = trades
+            .iter()
+            .filter(|trade| trade.kind == PositionKind::Call)
+            .map(|trade| trade.stressed_net_pnl)
+            .sum::<f64>();
+        let stressed_puts = trades
+            .iter()
+            .filter(|trade| trade.kind == PositionKind::Put)
+            .map(|trade| trade.stressed_net_pnl)
+            .sum::<f64>();
+        trades.len() as u64 >= self.config.canary_min_trades
+            && calls >= self.config.canary_min_call_trades
+            && puts >= self.config.canary_min_put_trades
+            && sessions >= self.config.canary_min_sessions
+            && stressed_total > 0.0
+            && stressed_calls > 0.0
+            && stressed_puts > 0.0
+            && !trading_regressed(
+                &trades.into_iter().cloned().collect::<Vec<_>>(),
+                self.config.live_regression_window_trades,
+                self.config.live_max_consecutive_losses,
+                self.config.canary_max_daily_loss * 2.0,
+            )
+    }
+
     async fn maybe_promote_live(&mut self, timestamp: i64) -> Result<(), AppError> {
-        if !self.is_learning()
-            || !self.learning_state.approved
-            || self.engine.position.is_some()
+        if self.engine.position.is_some()
             || self.reconciliation_blocked
             || self.risk.state.kill_switch
-            || (self.config.mode == Mode::Live && !self.config.live_ordering_ready())
-            || !self.has_fresh_option_calibration(timestamp)
-            || !self
-                .current_trend
-                .as_ref()
-                .is_some_and(|trend| trend.warmed_up)
         {
             return Ok(());
         }
-        if self.config.mode == Mode::Live {
-            self.refresh_live_account_clear(timestamp).await?;
-            if !self.real_account_clear {
-                return Ok(());
+        match self.live_stage {
+            LiveStage::Learning => {
+                if !self.learning_state.approved
+                    || !self.has_fresh_option_calibration(timestamp)
+                    || !self
+                        .current_trend
+                        .as_ref()
+                        .is_some_and(|trend| trend.warmed_up)
+                {
+                    return Ok(());
+                }
+                let report = self.learning_state.report(self.gate_requirements());
+                if !report.eligible {
+                    self.learning_state.approved = false;
+                    return Ok(());
+                }
+                self.transition_live_stage(
+                    timestamp,
+                    LiveStage::Eligible,
+                    "evidencia estadística aprobada",
+                )
             }
+            LiveStage::Eligible => {
+                if self.config.mode == Mode::Readonly {
+                    return Ok(());
+                }
+                self.refresh_live_account(timestamp).await?;
+                if !self.real_account_clear {
+                    return Ok(());
+                }
+                let Some(request) = self.ensure_authorization_request(timestamp)? else {
+                    return Ok(());
+                };
+                if !self.authorization_is_valid(&request, timestamp)? {
+                    return Ok(());
+                }
+                self.consume_authorization(timestamp)?;
+                self.transition_live_stage(
+                    timestamp,
+                    LiveStage::Armed,
+                    "autorización efímera validada y consumida",
+                )
+            }
+            LiveStage::Armed => {
+                self.refresh_live_account(timestamp).await?;
+                if !self.real_account_clear {
+                    return Ok(());
+                }
+                self.transition_live_stage(
+                    timestamp,
+                    LiveStage::Canary,
+                    "preflight aprobado; exposición canary",
+                )
+            }
+            LiveStage::Canary => {
+                if self.canary_eligible() {
+                    self.transition_live_stage(
+                        timestamp,
+                        LiveStage::Live,
+                        "canary reconciliado y métricas aprobadas",
+                    )?;
+                    self.trading_performance.clear();
+                }
+                Ok(())
+            }
+            LiveStage::Live => Ok(()),
         }
-        let report = self.learning_state.report(self.gate_requirements());
-        if !report.eligible {
-            self.learning_state.approved = false;
-            return Ok(());
-        }
-        self.transition_live_stage(timestamp, LiveStage::Live, "gate de Learning aprobado")
     }
 
-    async fn refresh_live_account_clear(&mut self, timestamp: i64) -> Result<(), AppError> {
+    async fn refresh_live_account(&mut self, timestamp: i64) -> Result<(), AppError> {
         if self.config.mode != Mode::Live
             || (timestamp.saturating_sub(self.last_account_reconciliation_secs) < 60
                 && self.real_account_clear)
@@ -1492,21 +2026,11 @@ impl TradingApp {
             MarketSource::Replay(_) => return Ok(()),
         };
         self.last_account_reconciliation_secs = timestamp;
-        let has_option_position = account.positions.iter().any(|position| position.is_option);
-        let has_pending_option = account.pending_orders.iter().any(|order| order.is_option);
-        self.real_account_clear = !has_option_position && !has_pending_option;
-        if !self.real_account_clear {
-            self.block_reconciliation(
-                timestamp,
-                "la cuenta IOL tiene posiciones u órdenes de opciones ajenas al estado operativo"
-                    .into(),
-            )?;
-        }
-        Ok(())
+        self.apply_account_snapshot(timestamp, account)
     }
 
     fn apply_pending_learning_return(&mut self, timestamp: i64) -> Result<(), AppError> {
-        if self.live_stage == LiveStage::Live
+        if self.live_stage != LiveStage::Learning
             && self.return_to_learning_pending
             && self.engine.position.is_none()
         {
@@ -1545,7 +2069,21 @@ impl TradingApp {
         )?;
         self.journal.sync()?;
         self.live_stage = to;
-        self.risk.state = Default::default();
+        self.risk.limits = if to == LiveStage::Canary {
+            RiskLimits {
+                max_notional: self.config.canary_max_investment_amount,
+                max_loss_per_trade: self.config.canary_max_loss_per_trade,
+                max_daily_loss: self.config.canary_max_daily_loss,
+                max_trades_per_day: self.config.canary_max_trades_per_day,
+            }
+        } else {
+            RiskLimits {
+                max_notional: self.config.max_investment_amount,
+                max_loss_per_trade: self.config.max_loss_per_trade,
+                max_daily_loss: self.config.max_daily_loss,
+                max_trades_per_day: self.config.max_trades_per_day,
+            }
+        };
         self.push_log(format!("Etapa cambió de {:?} a {:?}: {reason}", from, to));
         self.snapshot()?;
         Ok(())
@@ -1607,37 +2145,162 @@ fn affordable_contracts(
 }
 
 fn strategy_fingerprint(config: &Config) -> String {
-    let encoded = format!(
-        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
-        config.ticker,
-        config.check_interval_secs,
-        config.price_history_minutes,
-        config.min_samples_for_trend,
-        config.trend_change_samples,
-        config.trend_deadband_percentage,
-        config.min_trend_slope_percent_per_minute,
-        config.min_trend_r_squared,
-        config.min_trend_move_volatility_ratio,
-        config.option_expiry_days,
-        config.option_target_expiry_days,
-        config.option_max_expiry_days,
-        config.min_option_volume,
-        config.max_option_spread_percentage,
-        config.max_option_moneyness_distance_percentage,
-        config.stop_loss_percentage,
-        config.max_loss_per_trade,
-        config.min_profit_multiplier,
-        config.min_reward_risk_ratio,
-        config.contract_multiplier,
-        config.operating_cost_percentage(),
-        config.tax_percentage,
-        config.learning_slippage_bps,
+    strategy_manifest(config).fingerprint
+}
+
+fn strategy_manifest(config: &Config) -> StrategyManifest {
+    let mut parameters = BTreeMap::new();
+    parameters.insert("ticker".into(), config.ticker.clone());
+    macro_rules! add_parameter {
+        ($field:ident) => {
+            parameters.insert(stringify!($field).into(), config.$field.to_string());
+        };
+    }
+    add_parameter!(check_interval_secs);
+    add_parameter!(price_history_minutes);
+    add_parameter!(min_samples_for_trend);
+    add_parameter!(trend_change_samples);
+    add_parameter!(trend_deadband_percentage);
+    add_parameter!(min_trend_slope_percent_per_minute);
+    add_parameter!(min_trend_r_squared);
+    add_parameter!(min_trend_move_volatility_ratio);
+    add_parameter!(reversal_cooldown_secs);
+    parameters.insert(
+        "operating_cost_percentage_bucket_5bps".into(),
+        format!(
+            "{:.4}",
+            bucket_percentage(config.operating_cost_percentage(), 0.05)
+        ),
     );
-    ring::digest::digest(&ring::digest::SHA256, encoded.as_bytes())
+    add_parameter!(tax_percentage);
+    add_parameter!(min_profit_multiplier);
+    add_parameter!(option_expiry_days);
+    add_parameter!(option_target_expiry_days);
+    add_parameter!(option_max_expiry_days);
+    add_parameter!(max_position_size);
+    add_parameter!(position_timeout_mins);
+    add_parameter!(max_investment_amount);
+    add_parameter!(max_loss_per_trade);
+    add_parameter!(max_daily_loss);
+    add_parameter!(max_trades_per_day);
+    add_parameter!(stop_loss_percentage);
+    add_parameter!(contract_multiplier);
+    add_parameter!(readonly_slippage_bps);
+    add_parameter!(learning_slippage_bps);
+    add_parameter!(max_market_data_age_secs);
+    add_parameter!(max_option_spread_percentage);
+    add_parameter!(min_option_volume);
+    add_parameter!(max_option_moneyness_distance_percentage);
+    add_parameter!(min_reward_risk_ratio);
+    add_parameter!(live_learning_min_trades);
+    add_parameter!(live_learning_min_call_trades);
+    add_parameter!(live_learning_min_put_trades);
+    add_parameter!(live_learning_min_sessions);
+    add_parameter!(live_learning_min_profit_factor);
+    add_parameter!(live_regression_window_trades);
+    add_parameter!(live_max_consecutive_losses);
+    add_parameter!(canary_min_trades);
+    add_parameter!(canary_min_call_trades);
+    add_parameter!(canary_min_put_trades);
+    add_parameter!(canary_min_sessions);
+    add_parameter!(canary_max_position_size);
+    add_parameter!(canary_max_investment_amount);
+    add_parameter!(canary_max_loss_per_trade);
+    add_parameter!(canary_max_daily_loss);
+    add_parameter!(canary_max_trades_per_day);
+
+    let build_hash = strategy_build_hash();
+    let encoded = serde_json::to_vec(&(
+        EVIDENCE_SCHEMA_VERSION,
+        &build_hash,
+        &parameters,
+        gate_requirements_for_config(config),
+    ))
+    .expect("strategy manifest is serializable");
+    StrategyManifest {
+        schema_version: EVIDENCE_SCHEMA_VERSION,
+        fingerprint: digest_hex(&encoded),
+        build_hash,
+        package_version: env!("CARGO_PKG_VERSION").into(),
+        parameters,
+    }
+}
+
+fn strategy_build_hash() -> String {
+    let mut context = ring::digest::Context::new(&ring::digest::SHA256);
+    for source in [
+        include_str!("app.rs"),
+        include_str!("learning.rs"),
+        include_str!("market.rs"),
+        include_str!("pattern.rs"),
+        include_str!("risk.rs"),
+        include_str!("trading.rs"),
+    ] {
+        context.update(source.as_bytes());
+    }
+    context
+        .finish()
         .as_ref()
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+fn digest_hex(bytes: &[u8]) -> String {
+    ring::digest::digest(&ring::digest::SHA256, bytes)
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn argentina_day(timestamp_secs: i64) -> i64 {
+    timestamp_secs
+        .saturating_sub(3 * 60 * 60)
+        .div_euclid(86_400)
+}
+
+fn bucket_percentage(value: f64, bucket_size: f64) -> f64 {
+    if !value.is_finite() || bucket_size <= 0.0 {
+        value
+    } else {
+        (value / bucket_size).round() * bucket_size
+    }
+}
+
+fn load_evidence_bundle(path: &Path) -> Result<EvidenceBundle, AppError> {
+    Ok(serde_json::from_slice(&std::fs::read(path)?)?)
+}
+
+fn write_json_atomic<T: serde::Serialize>(path: &Path, value: &T) -> Result<(), AppError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let temporary = path.with_extension("json.tmp");
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&temporary)?;
+    file.write_all(&serde_json::to_vec_pretty(value)?)?;
+    file.sync_all()?;
+    std::fs::rename(&temporary, path)?;
+    if let Some(parent) = path.parent() {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+fn gate_requirements_for_config(config: &Config) -> GateRequirements {
+    GateRequirements {
+        min_trades: config.live_learning_min_trades,
+        min_call_trades: config.live_learning_min_call_trades,
+        min_put_trades: config.live_learning_min_put_trades,
+        min_sessions: config.live_learning_min_sessions,
+        min_profit_factor: config.live_learning_min_profit_factor,
+        max_daily_drawdown: config.max_daily_loss,
+        max_total_drawdown: config.max_daily_loss * 2.0,
+    }
 }
 
 fn unresolved_local_orders(events: &[JournalEvent]) -> Vec<String> {
@@ -1659,6 +2322,9 @@ fn unresolved_local_orders(events: &[JournalEvent]) -> Vec<String> {
                     pending.remove(&execution.operation_id);
                 }
             }
+            JournalEventKind::OrderUnknown { request, .. } => {
+                pending.insert(request.operation_id.clone(), true);
+            }
             _ => {}
         }
     }
@@ -1671,6 +2337,8 @@ fn apply_recovery_event(
     engine: &mut TradingEngine,
     portfolio: &mut Portfolio,
     risk: &mut RiskManager,
+    learning_state: &mut LearningState,
+    trading_performance: &mut Vec<ValidationTrade>,
     event: &JournalEvent,
 ) -> Result<(), AppError> {
     match &event.event {
@@ -1687,6 +2355,8 @@ fn apply_recovery_event(
             exit_price,
             net_pnl,
             reason,
+            stage,
+            validation_trade,
         } => {
             if portfolio.contains(operation_id) {
                 portfolio.close(
@@ -1696,7 +2366,17 @@ fn apply_recovery_event(
                     event.timestamp_secs,
                     *reason,
                 );
-                risk.record_close(*net_pnl);
+                risk.record_close_at(event.timestamp_secs, *net_pnl);
+            }
+            if let Some(trade) = validation_trade {
+                if *stage == LiveStage::Learning {
+                    learning_state.record(trade.clone());
+                } else if !trading_performance.iter().any(|existing| {
+                    !trade.context.trade_id.is_empty()
+                        && existing.context.trade_id == trade.context.trade_id
+                }) {
+                    trading_performance.push(trade.clone());
+                }
             }
             if engine
                 .position
@@ -1765,6 +2445,27 @@ fn unix_now() -> i64 {
         .unwrap_or_default()
 }
 
+fn dataset_id(path: &Path) -> Result<String, AppError> {
+    let bytes = std::fs::read(path)?;
+    Ok(format!("sha256:{}", digest_hex(&bytes)))
+}
+
+fn capture_market_frame(config: &Config, frame: &MarketFrame) -> Result<(), AppError> {
+    let argentina_day = frame
+        .underlying
+        .timestamp_secs
+        .saturating_sub(3 * 60 * 60)
+        .div_euclid(86_400);
+    let directory = config.data_dir.join("market").join(&config.ticker);
+    std::fs::create_dir_all(&directory)?;
+    let path = directory.join(format!("{argentina_day}.jsonl"));
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    serde_json::to_writer(&mut file, frame)?;
+    file.write_all(b"\n")?;
+    file.sync_data()?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1802,6 +2503,8 @@ mod tests {
             recover_state: false,
             data_dir: std::env::temp_dir()
                 .join(format!("options-app-test-{}-{unique}", std::process::id())),
+            replay_path: None,
+            capture_market_data: false,
             max_investment_amount: 100_000.0,
             max_loss_per_trade: 5_000.0,
             max_daily_loss: 10_000.0,
@@ -1824,9 +2527,19 @@ mod tests {
             live_learning_min_profit_factor: 1.25,
             live_regression_window_trades: 30,
             live_max_consecutive_losses: 3,
+            canary_min_trades: 20,
+            canary_min_call_trades: 5,
+            canary_min_put_trades: 5,
+            canary_min_sessions: 5,
+            canary_max_position_size: 1,
+            canary_max_investment_amount: 10_000.0,
+            canary_max_loss_per_trade: 500.0,
+            canary_max_daily_loss: 1_000.0,
+            canary_max_trades_per_day: 5,
             iol_base_url: "https://example.invalid".into(),
             iol_websocket_url: "wss://example.invalid".into(),
             iol_order_path: None,
+            live_authorization_path: None,
             live_confirmed: false,
         }
     }
@@ -1841,6 +2554,15 @@ mod tests {
             .closed_trades()
             .iter()
             .all(|trade| trade.position.entry_price < 10.0));
+    }
+
+    #[test]
+    fn a_second_instance_for_the_same_mode_is_rejected() {
+        let config = replay_config();
+        let first = TradingApp::new(config.clone()).unwrap();
+        let second = TradingApp::new(config);
+        assert!(matches!(second, Err(AppError::Recovery(_))));
+        drop(first);
     }
 
     #[tokio::test]
@@ -1907,6 +2629,35 @@ mod tests {
         app.evaluate_exit(frame.underlying.timestamp_secs)
             .await
             .unwrap();
+
+        assert!(app.engine.position.is_none());
+        assert_eq!(app.engine.last_exit_reason, Some(ExitReason::ProfitTarget));
+    }
+
+    #[tokio::test]
+    async fn pause_blocks_entries_but_still_closes_existing_risk() {
+        let mut app = TradingApp::new(replay_config()).unwrap();
+        app.step().await.unwrap();
+        let frame = app.current_frame.clone().unwrap();
+        let quote = frame.options.first().unwrap().clone();
+        app.live_stage = LiveStage::Live;
+        app.apply_account_snapshot(
+            frame.underlying.timestamp_secs,
+            AccountSnapshot {
+                positions: vec![AccountPosition {
+                    symbol: quote.symbol,
+                    quantity: 1,
+                    average_price: Some(0.01),
+                    kind: Some(PositionKind::from(quote.kind)),
+                    is_option: true,
+                }],
+                pending_orders: Vec::new(),
+            },
+        )
+        .unwrap();
+        app.paused = true;
+
+        app.step().await.unwrap();
 
         assert!(app.engine.position.is_none());
         assert_eq!(app.engine.last_exit_reason, Some(ExitReason::ProfitTarget));
@@ -1994,25 +2745,29 @@ mod tests {
             kind: PositionKind::Call,
             net_pnl: 10.0,
             stressed_net_pnl: 5.0,
-            closed_at_secs: 1,
+            closed_at_secs: 4 * 60 * 60,
+            context: ValidationContext::default(),
         });
         app.learning_state.record(ValidationTrade {
             kind: PositionKind::Put,
             net_pnl: 10.0,
             stressed_net_pnl: 5.0,
-            closed_at_secs: 2,
+            closed_at_secs: 86_400 + 4 * 60 * 60,
+            context: ValidationContext::default(),
         });
         app.learning_state.record(ValidationTrade {
             kind: PositionKind::Call,
             net_pnl: 10.0,
             stressed_net_pnl: 5.0,
-            closed_at_secs: 3,
+            closed_at_secs: 2 * 86_400 + 4 * 60 * 60,
+            context: ValidationContext::default(),
         });
         app.learning_state.record(ValidationTrade {
             kind: PositionKind::Put,
             net_pnl: 10.0,
             stressed_net_pnl: 5.0,
-            closed_at_secs: 4,
+            closed_at_secs: 3 * 86_400 + 4 * 60 * 60,
+            context: ValidationContext::default(),
         });
         app.learning_state.approved = true;
         app.cost_calibration = Some(CostCalibration {
@@ -2040,7 +2795,7 @@ mod tests {
         });
 
         app.maybe_promote_live(2).await.unwrap();
-        assert_eq!(app.live_stage, LiveStage::Live);
+        assert_eq!(app.live_stage, LiveStage::Eligible);
         assert!(!app.is_real_trading());
 
         app.return_to_learning_pending = true;
@@ -2049,16 +2804,17 @@ mod tests {
     }
 
     #[test]
-    fn live_routes_real_orders_only_after_reaching_live_stage() {
+    fn replay_never_routes_real_orders_even_when_configured_live() {
         let mut config = replay_config();
         config.mode = Mode::Live;
         config.live_confirmed = true;
         config.iol_order_path = Some("/verified-orders".into());
+        config.live_authorization_path = Some(config.data_dir.join("authorization.json"));
         let mut app = TradingApp::new(config).unwrap();
         assert_eq!(app.live_stage, LiveStage::Learning);
         assert!(!app.is_real_trading());
         app.live_stage = LiveStage::Live;
-        assert!(app.is_real_trading());
+        assert!(!app.is_real_trading());
     }
 
     #[test]
@@ -2134,5 +2890,27 @@ mod tests {
             },
         ];
         assert_eq!(unresolved_local_orders(&events), vec!["pending-1"]);
+    }
+
+    #[test]
+    fn startup_treats_unknown_order_result_as_pending() {
+        let request = OrderRequest {
+            operation_id: "unknown-1".into(),
+            symbol: "GAL-C-100".into(),
+            quantity: 1,
+            market_price: 2.0,
+            limit_price: 2.1,
+            side: OrderSide::Buy,
+        };
+        let events = vec![JournalEvent {
+            sequence: 1,
+            timestamp_secs: 1,
+            operation_id: Some(request.operation_id.clone()),
+            event: JournalEventKind::OrderUnknown {
+                request,
+                reason: "timeout".into(),
+            },
+        }];
+        assert_eq!(unresolved_local_orders(&events), vec!["unknown-1"]);
     }
 }

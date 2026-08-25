@@ -6,12 +6,11 @@ Sólo existen dos modos públicos y ambos consumen mercado real de IOL:
 
 - `readonly`: jamás envía órdenes. Simula fills conservadores para aprender, muestra
   cuándo debería comprar o vender y mide el resultado virtual.
-- `live`: durante Learning también simula. En la etapa Live envía órdenes reales,
-  únicamente si están configurados la confirmación y el contrato HTTP de IOL.
+- `live`: durante Learning también simula. Sólo Canary/Live envían órdenes reales,
+  con autorización efímera consumible y contrato HTTP de IOL configurado.
 
-Ambos persisten el ciclo `Learning → Live → Learning`. En readonly, Live significa
-que la estrategia quedó habilitada para emitir señales operables, no que pueda mover
-dinero.
+El ciclo persistente es `Learning → Eligible → Armed → Canary → Live`, con retorno
+fail-closed a Learning. Readonly se detiene en Eligible y nunca puede mover dinero.
 
 ## Compra y venta CALL/PUT
 
@@ -46,19 +45,20 @@ epoch. La señal necesita la ventana histórica completa, 30 confirmaciones,
 separación SMA ≥ 0,10%, pendiente normalizada ≥ 0,02% por minuto, `R² ≥ 0,60` y
 movimiento de al menos una desviación estándar.
 
-## Learning → Live
+## Learning → Eligible → Armed → Canary → Live
 
-Cada modo mantiene evidencia propia. Un epoch necesita como mínimo 200 cierres, 75
+La evidencia compatible se comparte por fingerprint de estrategia/build/gate. Un epoch necesita como mínimo 200 cierres, 75
 CALL, 75 PUT y 20 ruedas; resultado y expectativa positivos; profit factor ≥ 1,25
 total y por lado; bootstrap 95% positivo; drawdowns dentro de los límites y resultado
 positivo duplicando costos/slippage.
 
-La promoción automática ocurre estando plano, con datos y calibración vigentes,
+La promoción a Eligible ocurre estando plano, con datos y calibración vigentes,
 calentamiento completo y kill switch inactivo. `live` exige además cuenta IOL
-reconciliada, `LIVE_TRADING_CONFIRMATION` e `IOL_ORDER_PATH`. `readonly` no necesita
-autorización de órdenes porque su enrutador no puede enviarlas.
+reconciliada, `LIVE_TRADING_CONFIRMATION`, `IOL_ORDER_PATH` y un grant de 15 minutos
+ligado a cuenta/epoch/build/reporte. El grant se consume al pasar a Armed; Canary usa
+límites reducidos y debe aprobar su propio gate antes de Live.
 
-## Live → Learning
+## Degradación → Learning
 
 Ambos modos vuelven automáticamente a Learning al quedar planos ante tres pérdidas
 consecutivas, expectativa no positiva, profit factor reciente menor que uno,

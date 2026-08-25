@@ -2,7 +2,7 @@
 
 Motor de señales y trading de opciones en Rust conectado a IOL, con controles de riesgo, journal recuperable y una TUI de monitoreo.
 
-Sólo hay dos modos. `readonly` nunca envía órdenes: aprende, simula resultados y avisa cuándo debería comprar o vender. `live` usa el mismo ciclo automático `Learning ↔ Live`, pero en la etapa Live sí puede enviar órdenes reales después de aprobar todos los gates.
+Sólo hay dos modos operativos. `readonly` nunca envía órdenes: aprende, simula resultados y avisa cuándo debería comprar o vender. `live` usa el ciclo `Learning → Eligible → Armed → Canary → Live`; sólo Canary y Live pueden enviar órdenes reales después de aprobar todos los gates.
 
 > No es asesoramiento financiero. La estrategia incluida es simple y sirve para validar la plataforma; su rentabilidad no está demostrada.
 
@@ -14,7 +14,7 @@ Sólo hay dos modos. `readonly` nunca envía órdenes: aprende, simula resultado
 4. Filtra spread, volumen, vencimiento, distancia al dinero y frescura; luego elige la serie de menor fricción.
 5. Calcula la cantidad que entra simultáneamente en el presupuesto y en la pérdida neta máxima.
 6. Valida pérdidas y cantidad diaria de operaciones.
-7. Muestra la acción en readonly o envía una orden limitada exclusivamente en `MODE=live` y etapa Live.
+7. Muestra la acción en readonly o envía una orden limitada exclusivamente en `MODE=live` y etapa Canary/Live.
 8. Cierra por objetivo neto, stop-loss, reversión, timeout o cierre manual.
 9. Registra eventos tipados y snapshots atómicos para recuperación.
 10. Calibra comisión, IVA y otros aranceles con la última operación terminada de IOL.
@@ -55,11 +55,11 @@ cp .env.example .env
 MODE=readonly cargo run
 ```
 
-Autentica contra IOL y usa mercado real. Learning genera operaciones virtuales para reunir evidencia. Cuando aprueba el gate pasa a la etapa Live, donde continúa simulando y muestra `debería COMPRAR` o `debería VENDER` en consola/TUI. El enrutador de readonly nunca invoca el endpoint de órdenes.
+Autentica contra IOL y usa mercado real. Learning genera operaciones virtuales para reunir evidencia. Cuando aprueba el gate pasa a `Eligible`, donde continúa simulando y muestra `debería COMPRAR` o `debería VENDER` en consola/TUI. El enrutador de readonly nunca invoca el endpoint de órdenes.
 
 ### Live
 
-Live tiene las mismas dos etapas persistentes. Learning simula; al aprobar el gate cambia automáticamente a la etapa Live y recién allí puede operar dinero real. Una regresión o calibración vencida/cambiada bloquea entradas y vuelve a Learning al quedar plano.
+Learning simula; al aprobar el gate queda `Eligible`. Una autorización efímera ligada a cuenta, epoch, build, estrategia y reporte permite pasar por `Armed` a `Canary`. Canary usa límites reducidos y sólo pasa a Live tras acumular evidencia real suficiente. Una regresión o calibración vencida/cambiada bloquea entradas y vuelve a Learning al quedar plano.
 
 Además del gate estadístico, el envío de dinero real requiere estas dos variables. Pueden dejarse comentadas durante Learning; en ese caso el programa aprende pero no se promueve:
 
@@ -67,11 +67,28 @@ Además del gate estadístico, el envío de dinero real requiere estas dos varia
 MODE=live
 LIVE_TRADING_CONFIRMATION=I_UNDERSTAND_THIS_SENDS_REAL_ORDERS
 IOL_ORDER_PATH=/ruta/verificada/por/el/operador
+LIVE_AUTHORIZATION_PATH=data/live/live-authorization.json
+```
+
+Cuando aparezca `data/live/live-authorization-request.json`, revisar sus datos y emitir un grant de 15 minutos en otra invocación. El archivo se consume al usarlo y no puede reutilizarse:
+
+```bash
+cargo run -- --authorize-live data/live/live-authorization-request.json data/live/live-authorization.json
 ```
 
 La ruta no tiene un default deliberadamente: debe corresponder al contrato HTTP verificado para la cuenta/API usada. Una respuesta pendiente o parcialmente ejecutada detiene el motor y activa el kill switch para evitar asumir una ejecución inexistente.
 
-Antes del primer tick y periódicamente, `live` reconcilia cartera y órdenes de IOL. Cualquier ambigüedad bloquea el motor. Cada modo guarda su elegibilidad en `DATA_DIR/<modo>/learning-eligibility.json`.
+Antes del primer tick y periódicamente, `live` reconcilia cartera y órdenes de IOL. Cualquier ambigüedad bloquea el motor. La evidencia compatible se comparte por fingerprint bajo `DATA_DIR/evidence/<fingerprint>/`; cambiar estrategia, build o política del gate impide reutilizar evidencia incompatible.
+
+## Captura y replay acelerado
+
+Con `CAPTURE_MARKET_DATA=true`, cada frame validado de IOL se agrega a `DATA_DIR/market/<ticker>/<día>.jsonl`. Para reproducir un dataset a máxima velocidad, sin credenciales ni esperas de red:
+
+```bash
+MODE=readonly REPLAY_PATH=data/market/GGAL/20689.jsonl TUI_ENABLED=false RECOVER_STATE=false cargo run
+```
+
+El bundle registra el SHA-256 del dataset y las operaciones de replay quedan marcadas como evidencia histórica fuera de muestra. Para una validación honesta, reservar sesiones cronológicamente futuras para replay y no ajustar parámetros mirando ese tramo.
 
 ## Transporte IOL y datos de cuenta
 
@@ -112,6 +129,8 @@ Al iniciar, los costos configurados en variables de entorno son el fallback. Des
 | `MIN_OPTION_VOLUME` | `10` | Volumen mínimo de la serie |
 | `LIVE_LEARNING_MIN_TRADES` | `200` | Cierres mínimos del epoch antes de evaluar el gate |
 | `DATA_DIR` | `data` | Journal y snapshots por modo |
+| `CAPTURE_MARKET_DATA` | `true` | Guardar frames validados como JSONL |
+| `REPLAY_PATH` | — | Dataset JSONL reproducido sin conectarse a IOL |
 | `RECOVER_STATE` | `true` | Recuperar snapshot+journal |
 | `IOL_WEBSOCKET_URL` | `wss://websocket-movements.invertironline.com/` | WebSocket oficial de movimientos |
 

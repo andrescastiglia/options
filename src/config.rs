@@ -55,6 +55,8 @@ pub struct Config {
     pub tui_enabled: bool,
     pub recover_state: bool,
     pub data_dir: PathBuf,
+    pub replay_path: Option<PathBuf>,
+    pub capture_market_data: bool,
     pub max_investment_amount: f64,
     pub max_loss_per_trade: f64,
     pub max_daily_loss: f64,
@@ -77,9 +79,19 @@ pub struct Config {
     pub live_learning_min_profit_factor: f64,
     pub live_regression_window_trades: usize,
     pub live_max_consecutive_losses: u32,
+    pub canary_min_trades: u64,
+    pub canary_min_call_trades: u64,
+    pub canary_min_put_trades: u64,
+    pub canary_min_sessions: usize,
+    pub canary_max_position_size: u32,
+    pub canary_max_investment_amount: f64,
+    pub canary_max_loss_per_trade: f64,
+    pub canary_max_daily_loss: f64,
+    pub canary_max_trades_per_day: u32,
     pub iol_base_url: String,
     pub iol_websocket_url: String,
     pub iol_order_path: Option<String>,
+    pub live_authorization_path: Option<PathBuf>,
     pub live_confirmed: bool,
 }
 
@@ -137,6 +149,8 @@ impl Config {
             tui_enabled: parse_bool("TUI_ENABLED", true)?,
             recover_state: parse_bool("RECOVER_STATE", true)?,
             data_dir: PathBuf::from(env_or("DATA_DIR", "data")),
+            replay_path: env::var("REPLAY_PATH").ok().map(PathBuf::from),
+            capture_market_data: parse_bool("CAPTURE_MARKET_DATA", true)?,
             max_investment_amount: parse_f64_with_legacy(
                 "MAX_INVESTMENT_AMOUNT",
                 "MAX_NOTIONAL",
@@ -166,17 +180,29 @@ impl Config {
             live_learning_min_profit_factor: parse_f64("LIVE_LEARNING_MIN_PROFIT_FACTOR", 1.25)?,
             live_regression_window_trades: parse_usize("LIVE_REGRESSION_WINDOW_TRADES", 30)?,
             live_max_consecutive_losses: parse_u32("LIVE_MAX_CONSECUTIVE_LOSSES", 3)?,
+            canary_min_trades: parse_u64("CANARY_MIN_TRADES", 20)?,
+            canary_min_call_trades: parse_u64("CANARY_MIN_CALL_TRADES", 5)?,
+            canary_min_put_trades: parse_u64("CANARY_MIN_PUT_TRADES", 5)?,
+            canary_min_sessions: parse_usize("CANARY_MIN_SESSIONS", 5)?,
+            canary_max_position_size: parse_u32("CANARY_MAX_POSITION_SIZE", 1)?,
+            canary_max_investment_amount: parse_f64("CANARY_MAX_INVESTMENT_AMOUNT", 10_000.0)?,
+            canary_max_loss_per_trade: parse_f64("CANARY_MAX_LOSS_PER_TRADE", 500.0)?,
+            canary_max_daily_loss: parse_f64("CANARY_MAX_DAILY_LOSS", 1_000.0)?,
+            canary_max_trades_per_day: parse_u32("CANARY_MAX_TRADES_PER_DAY", 5)?,
             iol_base_url: env_or("IOL_BASE_URL", "https://api.invertironline.com"),
             iol_websocket_url: env_or(
                 "IOL_WEBSOCKET_URL",
                 "wss://websocket-movements.invertironline.com/",
             ),
             iol_order_path: env::var("IOL_ORDER_PATH").ok(),
+            live_authorization_path: env::var("LIVE_AUTHORIZATION_PATH").ok().map(PathBuf::from),
             live_confirmed: env::var("LIVE_TRADING_CONFIRMATION")
                 .is_ok_and(|value| value == LIVE_CONFIRMATION),
         };
         config.validate()?;
-        if env::var("IOL_USERNAME").is_err() || env::var("IOL_PASSWORD").is_err() {
+        if config.replay_path.is_none()
+            && (env::var("IOL_USERNAME").is_err() || env::var("IOL_PASSWORD").is_err())
+        {
             return Err(ConfigError::MissingSecret("IOL_USERNAME/IOL_PASSWORD"));
         }
         Ok(config)
@@ -262,6 +288,13 @@ impl Config {
             || self.live_learning_min_sessions == 0
             || self.live_regression_window_trades == 0
             || self.live_max_consecutive_losses == 0
+            || self.canary_min_trades == 0
+            || self.canary_min_call_trades + self.canary_min_put_trades > self.canary_min_trades
+            || self.canary_min_sessions == 0
+            || self.canary_max_position_size == 0
+            || self.canary_max_position_size > self.max_position_size
+            || self.canary_max_trades_per_day == 0
+            || self.canary_max_trades_per_day > self.max_trades_per_day
         {
             return invalid("STRATEGY_LIMITS", "límites de estrategia inconsistentes");
         }
@@ -289,6 +322,21 @@ impl Config {
             1.0,
             10.0,
         )?;
+        positive_float(
+            "CANARY_MAX_INVESTMENT_AMOUNT",
+            self.canary_max_investment_amount,
+        )?;
+        positive_float("CANARY_MAX_LOSS_PER_TRADE", self.canary_max_loss_per_trade)?;
+        positive_float("CANARY_MAX_DAILY_LOSS", self.canary_max_daily_loss)?;
+        if self.canary_max_investment_amount > self.max_investment_amount
+            || self.canary_max_loss_per_trade > self.max_loss_per_trade
+            || self.canary_max_daily_loss > self.max_daily_loss
+        {
+            return invalid(
+                "CANARY_LIMITS",
+                "los límites canary no pueden superar los límites live",
+            );
+        }
         if self.ticker.trim().is_empty() {
             return invalid("TICKER", &self.ticker);
         }
@@ -334,6 +382,7 @@ impl Config {
                 .iol_order_path
                 .as_deref()
                 .is_some_and(|path| !path.trim().is_empty())
+            && self.live_authorization_path.is_some()
     }
 }
 
@@ -473,6 +522,8 @@ mod tests {
             tui_enabled: true,
             recover_state: false,
             data_dir: PathBuf::from("data"),
+            replay_path: None,
+            capture_market_data: true,
             max_investment_amount: 100_000.0,
             max_loss_per_trade: 5_000.0,
             max_daily_loss: 10_000.0,
@@ -495,9 +546,19 @@ mod tests {
             live_learning_min_profit_factor: 1.25,
             live_regression_window_trades: 30,
             live_max_consecutive_losses: 3,
+            canary_min_trades: 20,
+            canary_min_call_trades: 5,
+            canary_min_put_trades: 5,
+            canary_min_sessions: 5,
+            canary_max_position_size: 1,
+            canary_max_investment_amount: 10_000.0,
+            canary_max_loss_per_trade: 500.0,
+            canary_max_daily_loss: 1_000.0,
+            canary_max_trades_per_day: 5,
             iol_base_url: "https://example.invalid".into(),
             iol_websocket_url: "wss://example.invalid".into(),
             iol_order_path: None,
+            live_authorization_path: None,
             live_confirmed: false,
         }
     }
@@ -523,6 +584,8 @@ mod tests {
         config.live_confirmed = true;
         assert!(!config.live_ordering_ready());
         config.iol_order_path = Some("/api/orders".into());
+        assert!(!config.live_ordering_ready());
+        config.live_authorization_path = Some("data/live/authorization.json".into());
         assert!(config.live_ordering_ready());
     }
 

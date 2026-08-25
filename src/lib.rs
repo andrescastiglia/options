@@ -4,6 +4,7 @@ pub mod config;
 pub mod errors;
 pub mod iol_client;
 pub mod learning;
+pub mod learning_model;
 pub mod market;
 mod number_format;
 pub mod pattern;

@@ -36,6 +36,10 @@ pub enum JournalEventKind {
     OrderUpdated {
         execution: OrderExecution,
     },
+    OrderUnknown {
+        request: crate::broker::OrderRequest,
+        reason: String,
+    },
     PositionOpened {
         position: Position,
     },
@@ -44,6 +48,10 @@ pub enum JournalEventKind {
         exit_price: f64,
         net_pnl: f64,
         reason: ExitReason,
+        #[serde(default)]
+        stage: LiveStage,
+        #[serde(default)]
+        validation_trade: Option<ValidationTrade>,
     },
     RiskRejected {
         reason: String,

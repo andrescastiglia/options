@@ -1,7 +1,7 @@
 # Detalles de Implementación - Trading de Opciones Rust
 
 Estado de implementacion:
-- El motor continuo está implementado para `readonly` y `live`, ambos con etapas automáticas Learning y Live. Readonly sólo simula y avisa; live opera realmente sólo en su etapa Live.
+- El motor continuo está implementado para `readonly` y `live` con estados Learning, Eligible, Armed, Canary y Live. Readonly sólo simula y se detiene en Eligible; las órdenes reales sólo están habilitadas en Canary/Live.
 - La UI ratatui muestra mercado, señal, posición, P&L, riesgo y eventos, con pausa, kill switch, cierre manual y snapshot.
 - El cliente IOL soporta OAuth, refresh, retry/circuit breaker, parsing de cadena y envío de órdenes a una ruta configurada. Live requiere confirmación explícita y contrato HTTP verificado por el operador.
 
@@ -10,7 +10,7 @@ Notas de diseño:
 - Logs: salida simple y profesional (tracing, niveles info/warn/error).
 - Trace: journal append-only para auditoría y replay.
 - Persistencia: sin base de datos por defecto — estado en memoria y snapshots opcionales.
-- Modo por defecto: `readonly`, conectado a IOL y sin capacidad de enviar órdenes. `live` comparte el gate y habilita órdenes sólo después de aprobar Learning.
+- Modo por defecto: `readonly`, conectado a IOL y sin capacidad de enviar órdenes. `live` comparte el gate y requiere además un grant efímero antes de Canary.
 - Diagramas en la documentación generados con Mermaid para claridad y profesionalismo.
 
 

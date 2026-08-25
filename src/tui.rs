@@ -10,11 +10,13 @@ use crossterm::{
 };
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Direction as LayoutDirection, Layout},
+    layout::{Alignment, Constraint, Direction as LayoutDirection, Layout, Rect},
     style::{Color, Modifier, Style},
     symbols,
     text::{Line, Span},
-    widgets::{Axis, Block, Borders, Chart, Dataset, Gauge, GraphType, Paragraph, Sparkline, Wrap},
+    widgets::{
+        Axis, Block, Borders, Chart, Clear, Dataset, Gauge, GraphType, Paragraph, Sparkline, Wrap,
+    },
     Frame, Terminal,
 };
 
@@ -56,12 +58,21 @@ pub async fn run(app: &mut TradingApp) -> Result<(), AppError> {
     terminal.clear()?;
     let tick_duration = Duration::from_secs(app.config.check_interval_secs);
     let mut next_tick = tokio::time::Instant::now();
+    let mut connection_failure_is_terminal = false;
 
     loop {
         terminal.draw(|frame| draw(frame, app))?;
         if event::poll(Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
+                    if connection_failure_is_terminal {
+                        match key.code {
+                            KeyCode::Char('q') | KeyCode::Esc => break,
+                            KeyCode::Char('s') => app.snapshot()?,
+                            _ => {}
+                        }
+                        continue;
+                    }
                     match key.code {
                         KeyCode::Char('q') | KeyCode::Esc => break,
                         KeyCode::Char(' ') | KeyCode::Char('p') => app.toggle_pause(),
@@ -79,8 +90,39 @@ pub async fn run(app: &mut TradingApp) -> Result<(), AppError> {
                 }
             }
         }
-        if tokio::time::Instant::now() >= next_tick {
-            let running = app.step().await?;
+        if !connection_failure_is_terminal && tokio::time::Instant::now() >= next_tick {
+            let running = match app.step().await {
+                Ok(running) => running,
+                Err(mut last_error @ AppError::Connection(_)) => {
+                    let attempts = app.config.connection_retry_attempts;
+                    let delay = Duration::from_secs(app.config.connection_retry_delay_secs);
+                    let mut recovered = None;
+                    for attempt in 1..=attempts {
+                        app.mark_connection_retry(attempt, attempts, &last_error);
+                        terminal.draw(|frame| draw(frame, app))?;
+                        tokio::time::sleep(delay).await;
+                        match app.step().await {
+                            Ok(running) => {
+                                app.mark_connection_restored();
+                                recovered = Some(running);
+                                break;
+                            }
+                            Err(error @ AppError::Connection(_)) => last_error = error,
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    match recovered {
+                        Some(running) => running,
+                        None => {
+                            app.mark_connection_not_operational(attempts, &last_error)?;
+                            connection_failure_is_terminal = true;
+                            terminal.draw(|frame| draw(frame, app))?;
+                            true
+                        }
+                    }
+                }
+                Err(error) => return Err(error),
+            };
             next_tick = tokio::time::Instant::now() + tick_duration;
             if !running && app.engine.position.is_none() {
                 terminal.draw(|frame| draw(frame, app))?;
@@ -248,6 +290,46 @@ fn draw(frame: &mut Frame, app: &TradingApp) {
         ]))
         .style(Style::default().fg(MUTED_GRAY)),
         rows[4],
+    );
+    if !app.connection_operational {
+        render_not_operational(frame, area, &app.status);
+    }
+}
+
+fn render_not_operational(frame: &mut Frame, area: Rect, detail: &str) {
+    let vertical = Layout::vertical([
+        Constraint::Percentage(30),
+        Constraint::Length(9),
+        Constraint::Percentage(30),
+    ])
+    .split(area);
+    let popup = Layout::horizontal([
+        Constraint::Percentage(10),
+        Constraint::Percentage(80),
+        Constraint::Percentage(10),
+    ])
+    .split(vertical[1])[1];
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                "NO OPERATIVO · SIN CONEXIÓN CON IOL",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(detail),
+            Line::from(""),
+            Line::from("No se procesan precios ni órdenes. Presione q para salir."),
+        ])
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: true })
+        .block(
+            Block::default()
+                .title(" ALERTA CRÍTICA ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Red)),
+        ),
+        popup,
     );
 }
 
@@ -811,6 +893,7 @@ fn connection_color(status: &str) -> Color {
         || status.contains("rechaz")
         || status.contains("desconect")
         || status.contains("fall")
+        || status.contains("no operativo")
     {
         Color::Red
     } else if status.contains("esperando") || status.contains("conectando") {

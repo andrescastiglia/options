@@ -78,7 +78,7 @@ jobs:
           cargo mutants "${selected_files[@]}" --timeout 180 -- --all-targets --all-features --locked
       - name: Archive mutation report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: critical-mutation-report-${{ matrix.domain }}
           path: mutants.out/
@@ -106,7 +106,7 @@ jobs:
           test "${#reports[@]}" -eq 5
           python3 scripts/normalize_readiness_mutation.py "$build_hash" readiness-mutation.json "${reports[@]}"
       - name: Archive normalized mutation evidence
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: readiness-mutation-${{ github.sha }}
           path: readiness-mutation.json

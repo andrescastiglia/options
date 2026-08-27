@@ -102,7 +102,7 @@ jobs:
       - name: Enforce critical-module baselines
         run: python3 scripts/check_coverage.py coverage.json
       - name: Archive coverage report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: rust-coverage-${{ github.sha }}
           path: coverage.json
@@ -141,7 +141,7 @@ jobs:
           build_hash="$(cargo +nightly run --quiet --locked -- --print-build-hash)"
           python3 scripts/normalize_readiness_coverage.py readiness-coverage-raw.json "$build_hash" readiness-coverage.json
       - name: Archive readiness coverage evidence
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: readiness-coverage-${{ github.sha }}
           path: |
@@ -214,7 +214,7 @@ jobs:
       - name: Generate reproducible CycloneDX 1.5 SBOM
         run: cargo cyclonedx --all-features --target all --format json --spec-version 1.5 --override-filename options-trading.cdx
       - name: Upload SBOM
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: options-trading-cyclonedx-${{ github.sha }}
           path: options-trading.cdx.json

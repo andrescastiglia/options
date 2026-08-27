@@ -1,0 +1,1 @@
+{"schema_version":6,"sequence":1,"timestamp_secs":1700000000,"operation_id":"fuzz-operation","event":{"type":"order_intent_created","request":{"operation_id":"fuzz-operation","symbol":"GGALC100","quantity":2,"market_price":2.0,"limit_price":2.1,"side":"Buy"}},"previous_hash":"","event_hash":"","event_hmac":""}

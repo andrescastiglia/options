@@ -157,14 +157,13 @@ impl RiskManager {
 }
 
 fn argentina_day(timestamp_secs: i64) -> i64 {
-    timestamp_secs
-        .saturating_sub(3 * 60 * 60)
-        .div_euclid(86_400)
+    crate::time_utils::argentina_session_day(timestamp_secs)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn risk() -> RiskManager {
         RiskManager::new(RiskLimits {
@@ -177,15 +176,24 @@ mod tests {
 
     #[test]
     fn blocks_notional_above_limit() {
-        assert!(risk().allow_entry(1_001.0).is_err());
+        let mut manager = risk();
+        assert_eq!(manager.allow_entry(manager.limits.max_notional), Ok(()));
+        assert_eq!(
+            manager.allow_entry(1_001.0),
+            Err("nocional excede el limite".into())
+        );
     }
 
     #[test]
     fn daily_loss_engages_kill_switch() {
-        let mut risk = risk();
-        risk.record_close_at(1_000, -200.0);
-        assert!(risk.state.kill_switch);
-        assert!(risk.allow_entry(10.0).is_err());
+        let mut profitable = risk();
+        profitable.record_close_at(1_000, 50.0);
+        assert!(!profitable.state.kill_switch);
+
+        let mut losing = risk();
+        losing.record_close_at(1_000, -200.0);
+        assert!(losing.state.kill_switch);
+        assert!(losing.allow_entry(10.0).is_err());
     }
 
     #[test]
@@ -216,5 +224,87 @@ mod tests {
         assert!(risk.resume().is_err());
         risk.clear_operational_halt();
         assert!(!risk.state.kill_switch);
+    }
+
+    #[test]
+    fn every_entry_limit_and_resume_boundary_fails_closed() {
+        for invalid in [f64::NAN, f64::INFINITY, 0.0, -1.0] {
+            let mut manager = risk();
+            assert_eq!(
+                manager.allow_entry(invalid),
+                Err("nocional invalido".into())
+            );
+        }
+
+        let mut daily = risk();
+        daily.state.realized_pnl = -daily.limits.max_daily_loss;
+        assert_eq!(
+            daily.allow_entry(10.0),
+            Err("limite de perdida diaria alcanzado".into())
+        );
+        assert_eq!(
+            daily.resume(),
+            Err("no se puede reanudar: perdida diaria excedida".into())
+        );
+
+        let mut trades = risk();
+        trades.state.trades_today = trades.limits.max_trades_per_day;
+        assert_eq!(
+            trades.allow_entry(10.0),
+            Err("limite diario de operaciones alcanzado".into())
+        );
+        trades.state.trades_today = 0;
+        assert_eq!(trades.allow_entry(10.0), Ok(()));
+        assert_eq!(trades.state.last_rejection, None);
+
+        let mut non_finite_close = risk();
+        non_finite_close.record_close(f64::NAN);
+        assert_eq!(non_finite_close.state.realized_pnl, 0.0);
+        assert_eq!(non_finite_close.state.trades_today, 1);
+
+        let mut manual = risk();
+        manual.engage_kill_switch();
+        assert_eq!(manual.resume(), Ok(()));
+        assert!(!manual.state.kill_switch);
+        manual.engage_kill_switch();
+        manual.clear_operational_halt();
+        assert!(manual.state.kill_switch);
+        assert_eq!(
+            manual.state.kill_switch_reason,
+            Some(KillSwitchReason::Manual)
+        );
+    }
+
+    proptest! {
+        #[test]
+        fn notional_boundary_is_closed_and_deterministic(
+            limit in 0.01_f64..1_000_000.0,
+            candidate in 0.01_f64..2_000_000.0,
+        ) {
+            let mut manager = RiskManager::new(RiskLimits {
+                max_notional: limit,
+                max_loss_per_trade: 1.0,
+                max_daily_loss: 1_000_000.0,
+                max_trades_per_day: u32::MAX,
+            });
+            prop_assert_eq!(manager.allow_entry(candidate).is_ok(), candidate <= limit);
+        }
+
+        #[test]
+        fn finite_closed_trade_pnl_is_accumulated_exactly(values in prop::collection::vec(-10_000.0_f64..10_000.0, 0..100)) {
+            let mut manager = RiskManager::new(RiskLimits {
+                max_notional: 1.0,
+                max_loss_per_trade: 1.0,
+                max_daily_loss: 2_000_000.0,
+                max_trades_per_day: u32::MAX,
+            });
+            for value in &values {
+                manager.record_close(*value);
+            }
+            let expected = values.iter().sum::<f64>();
+            let tolerance = 1e-9 * expected.abs().max(1.0);
+            prop_assert!((manager.state.realized_pnl - expected).abs() <= tolerance);
+            prop_assert_eq!(manager.state.trades_today, values.len() as u32);
+        }
     }
 }

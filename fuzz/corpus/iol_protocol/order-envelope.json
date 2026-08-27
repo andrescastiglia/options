@@ -1,0 +1,1 @@
+{"request":{"operation_id":"fuzz-operation","symbol":"GGALC100","quantity":2,"market_price":2.0,"limit_price":2.1,"side":"Buy"},"response":{"numeroOperacion":"42","estado":"Ejecutada","cantidadOperada":2,"precioOperado":2.05}}

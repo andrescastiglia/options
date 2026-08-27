@@ -1,0 +1,64 @@
+name: Extended fuzz campaigns
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "31 4 * * 0"
+
+permissions:
+  contents: read
+
+jobs:
+  prolonged-fuzz:
+    name: prolonged fuzz corpus
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install nightly Rust
+        uses: dtolnay/rust-toolchain@nightly
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - name: Cache Cargo and seed corpus
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - name: Prepare evidence directory
+        run: mkdir -p fuzz/evidence fuzz/corpus
+      - name: Fuzz market frames for one hour
+        run: |
+          set -o pipefail
+          cargo +nightly fuzz run --target x86_64-unknown-linux-gnu market_frame -- -max_total_time=3600 -rss_limit_mb=2048 2>&1 | tee fuzz/evidence/market_frame.log
+          echo 3600 > fuzz/evidence/market_frame.seconds
+      - name: Fuzz journal records for one hour
+        run: |
+          set -o pipefail
+          cargo +nightly fuzz run --target x86_64-unknown-linux-gnu journal_event -- -max_total_time=3600 -rss_limit_mb=2048 2>&1 | tee fuzz/evidence/journal_event.log
+          echo 3600 > fuzz/evidence/journal_event.seconds
+      - name: Fuzz IOL and WebSocket protocol for one hour
+        run: |
+          set -o pipefail
+          cargo +nightly fuzz run --target x86_64-unknown-linux-gnu iol_protocol -- -max_total_time=3600 -rss_limit_mb=2048 2>&1 | tee fuzz/evidence/iol_protocol.log
+          echo 3600 > fuzz/evidence/iol_protocol.seconds
+      - name: Record exact build identity
+        run: |
+          cargo run --quiet --locked -- --print-build-hash > fuzz/evidence/build-hash.txt
+          git rev-parse HEAD > fuzz/evidence/commit.txt
+      - name: Create reproducible reviewed artifact
+        run: |
+          source_date_epoch="$(git show -s --format=%ct HEAD)"
+          tar --sort=name --mtime="@${source_date_epoch}" --owner=0 --group=0 --numeric-owner --zstd \
+            -cf fuzz-evidence.tar.zst fuzz/corpus fuzz/evidence
+          sha256sum fuzz-evidence.tar.zst > fuzz-evidence.tar.zst.sha256
+      - name: Archive corpus and execution evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-evidence-${{ github.sha }}
+          path: |
+            fuzz-evidence.tar.zst
+            fuzz-evidence.tar.zst.sha256
+          if-no-files-found: error
+          retention-days: 90

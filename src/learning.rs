@@ -2,11 +2,13 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::learning_model::{assess_meta_filter, MetaFilterAssessment};
+use crate::learning_model::{
+    assess_meta_filter_with_policy, MetaFilterAssessment, MetaFilterPolicy,
+};
 use crate::trading::PositionKind;
 
-pub const EVIDENCE_SCHEMA_VERSION: u32 = 1;
-pub const AUTHORIZATION_SCHEMA_VERSION: u32 = 1;
+pub const EVIDENCE_SCHEMA_VERSION: u32 = 6;
+pub const AUTHORIZATION_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -34,6 +36,9 @@ pub struct ValidationTrade {
 #[serde(rename_all = "snake_case")]
 pub enum EvidenceSource {
     HistoricalOutOfSample,
+    /// Replay útil para investigación, pero sin procedencia/split sellados. No
+    /// puede contribuir al gate que habilita dinero real.
+    ResearchReplay,
     #[default]
     Shadow,
     Canary,
@@ -59,6 +64,38 @@ pub struct ValidationContext {
     pub trend_confidence: Option<f64>,
     pub trend_r_squared: Option<f64>,
     pub trend_slope_percent_per_minute: Option<f64>,
+    #[serde(default)]
+    pub vix_level: Option<f64>,
+    #[serde(default)]
+    pub vix_change_percentage: Option<f64>,
+    #[serde(default)]
+    pub lunch_slowdown: bool,
+    #[serde(default)]
+    pub lunch_quote_updates: Option<u64>,
+    #[serde(default)]
+    pub intrinsic_value: Option<f64>,
+    #[serde(default)]
+    pub extrinsic_value: Option<f64>,
+    #[serde(default)]
+    pub implied_volatility: Option<f64>,
+    #[serde(default)]
+    pub iv_rank: Option<f64>,
+    #[serde(default)]
+    pub iv_rank_window_sessions: Option<usize>,
+    #[serde(default)]
+    pub iv_rank_observations: Option<usize>,
+    #[serde(default)]
+    pub iv_rank_missing_reason: Option<String>,
+    #[serde(default)]
+    pub delta: Option<f64>,
+    #[serde(default)]
+    pub gamma: Option<f64>,
+    #[serde(default)]
+    pub theta_per_day: Option<f64>,
+    #[serde(default)]
+    pub vega_per_point: Option<f64>,
+    #[serde(default)]
+    pub rho_per_point: Option<f64>,
     pub exit_reason: Option<String>,
 }
 
@@ -94,6 +131,12 @@ impl LearningState {
     }
 
     pub fn record(&mut self, trade: ValidationTrade) -> bool {
+        if matches!(
+            trade.context.source,
+            EvidenceSource::ResearchReplay | EvidenceSource::HistoricalOutOfSample
+        ) {
+            return false;
+        }
         if !trade.context.trade_id.is_empty()
             && self
                 .trades
@@ -125,6 +168,8 @@ pub struct GateRequirements {
     pub min_profit_factor: f64,
     pub max_daily_drawdown: f64,
     pub max_total_drawdown: f64,
+    #[serde(default)]
+    pub meta_filter_policy: MetaFilterPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -165,6 +210,7 @@ pub struct AuthorizationRequest {
     pub epoch: u64,
     pub strategy_fingerprint: String,
     pub build_hash: String,
+    pub readiness_sha256: String,
     pub report_sha256: String,
     pub canary_max_position_size: u32,
     pub canary_max_investment_amount: f64,
@@ -180,6 +226,16 @@ pub struct ExecutionAuthorization {
     pub issued_at_secs: i64,
     pub expires_at_secs: i64,
     pub confirmation: String,
+    pub nonce: String,
+    pub signature: String,
+}
+
+impl ExecutionAuthorization {
+    pub fn signing_payload(&self) -> Result<Vec<u8>, serde_json::Error> {
+        let mut unsigned = self.clone();
+        unsigned.signature.clear();
+        serde_json::to_vec(&unsigned)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -208,6 +264,12 @@ pub struct LearningReport {
     #[serde(default)]
     pub put_stressed_net_pnl: f64,
     #[serde(default)]
+    pub lunch_trades: u64,
+    #[serde(default)]
+    pub lunch_stressed_expectancy: f64,
+    #[serde(default)]
+    pub non_lunch_stressed_expectancy: f64,
+    #[serde(default)]
     pub expectancy_r: f64,
     #[serde(default)]
     pub call_expectancy_r_lower_95: f64,
@@ -234,6 +296,14 @@ impl LearningReport {
         let puts: Vec<_> = trades
             .iter()
             .filter(|trade| trade.kind == PositionKind::Put)
+            .collect();
+        let lunch_trades: Vec<_> = trades
+            .iter()
+            .filter(|trade| trade.context.lunch_slowdown)
+            .collect();
+        let non_lunch_trades: Vec<_> = trades
+            .iter()
+            .filter(|trade| !trade.context.lunch_slowdown)
             .collect();
         let sessions = trades
             .iter()
@@ -349,7 +419,7 @@ impl LearningReport {
             &mut blocking_reasons,
         );
         let eligible = blocking_reasons.is_empty();
-        let meta_filter = assess_meta_filter(trades);
+        let meta_filter = assess_meta_filter_with_policy(trades, requirements.meta_filter_policy);
         Self {
             epoch,
             strategy_fingerprint: fingerprint.to_string(),
@@ -372,6 +442,13 @@ impl LearningReport {
             stressed_net_pnl,
             call_stressed_net_pnl: call_stressed,
             put_stressed_net_pnl: put_stressed,
+            lunch_trades: lunch_trades.len() as u64,
+            lunch_stressed_expectancy: mean(
+                lunch_trades.iter().map(|trade| trade.stressed_net_pnl),
+            ),
+            non_lunch_stressed_expectancy: mean(
+                non_lunch_trades.iter().map(|trade| trade.stressed_net_pnl),
+            ),
             expectancy_r,
             call_expectancy_r_lower_95: call_r_lower,
             put_expectancy_r_lower_95: put_r_lower,
@@ -406,9 +483,7 @@ pub fn trading_regressed(
 }
 
 fn argentina_day(timestamp_secs: i64) -> i64 {
-    timestamp_secs
-        .saturating_sub(3 * 60 * 60)
-        .div_euclid(86_400)
+    crate::time_utils::argentina_session_day(timestamp_secs)
 }
 
 fn mean(values: impl Iterator<Item = f64>) -> f64 {
@@ -528,6 +603,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unsealed_replay_never_enters_live_eligibility_evidence() {
+        let mut state = LearningState::new("strategy".into());
+        let trade = ValidationTrade {
+            kind: PositionKind::Call,
+            net_pnl: 10.0,
+            stressed_net_pnl: 8.0,
+            closed_at_secs: 1,
+            context: ValidationContext {
+                trade_id: "research-1".into(),
+                source: EvidenceSource::ResearchReplay,
+                ..ValidationContext::default()
+            },
+        };
+        assert!(!state.record(trade));
+        assert!(state.trades.is_empty());
+
+        let historical_without_verified_manifest = ValidationTrade {
+            kind: PositionKind::Put,
+            net_pnl: 10.0,
+            stressed_net_pnl: 8.0,
+            closed_at_secs: 2,
+            context: ValidationContext {
+                trade_id: "unverified-historical-1".into(),
+                source: EvidenceSource::HistoricalOutOfSample,
+                ..ValidationContext::default()
+            },
+        };
+        assert!(!state.record(historical_without_verified_manifest));
+        assert!(state.trades.is_empty());
+    }
+
+    #[test]
     fn gate_requires_both_directions() {
         let state = LearningState {
             epoch: 1,
@@ -551,6 +658,7 @@ mod tests {
             min_profit_factor: 1.0,
             max_daily_drawdown: 100.0,
             max_total_drawdown: 100.0,
+            meta_filter_policy: MetaFilterPolicy::default(),
         });
         assert!(!report.eligible);
     }
@@ -567,6 +675,50 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert!(trading_regressed(&trades, 30, 3, 100.0));
+    }
+
+    #[test]
+    fn report_separates_lunch_and_non_lunch_stressed_expectancy() {
+        let trades = vec![
+            ValidationTrade {
+                kind: PositionKind::Call,
+                net_pnl: 5.0,
+                stressed_net_pnl: 4.0,
+                closed_at_secs: 1,
+                context: ValidationContext {
+                    lunch_slowdown: true,
+                    lunch_quote_updates: Some(3),
+                    ..ValidationContext::default()
+                },
+            },
+            ValidationTrade {
+                kind: PositionKind::Put,
+                net_pnl: 10.0,
+                stressed_net_pnl: 8.0,
+                closed_at_secs: 2,
+                context: ValidationContext::default(),
+            },
+        ];
+        let report = LearningState {
+            epoch: 1,
+            strategy_fingerprint: "lunch-evidence".into(),
+            trades,
+            approved: false,
+        }
+        .report(GateRequirements {
+            min_trades: 0,
+            min_call_trades: 0,
+            min_put_trades: 0,
+            min_sessions: 0,
+            min_profit_factor: 1.0,
+            max_daily_drawdown: 100.0,
+            max_total_drawdown: 100.0,
+            meta_filter_policy: MetaFilterPolicy::default(),
+        });
+
+        assert_eq!(report.lunch_trades, 1);
+        assert_eq!(report.lunch_stressed_expectancy, 4.0);
+        assert_eq!(report.non_lunch_stressed_expectancy, 8.0);
     }
 
     #[test]
@@ -598,6 +750,7 @@ mod tests {
             min_profit_factor: 1.25,
             max_daily_drawdown: 100.0,
             max_total_drawdown: 200.0,
+            meta_filter_policy: MetaFilterPolicy::default(),
         });
         assert!(report.eligible);
         assert!(report.call_expectancy_lower_95 > 0.0);

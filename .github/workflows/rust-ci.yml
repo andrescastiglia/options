@@ -20,11 +20,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.98.0
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
       - name: Cargo check
-        run: cargo check --all-targets --all-features
+        run: cargo check --all-targets --all-features --locked
+      - name: Cargo fmt
+        run: cargo fmt --all --check
 
   clippy:
     name: clippy
@@ -33,13 +35,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.98.0
         with:
           components: clippy
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
       - name: Cargo clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
   test:
     name: test
@@ -48,8 +50,173 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.98.0
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
       - name: Cargo test
-        run: cargo test --all-targets --all-features
+        run: cargo test --all-targets --all-features --locked
+
+  fuzz-smoke:
+    name: fuzz-smoke
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install nightly Rust
+        uses: dtolnay/rust-toolchain@nightly
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - name: Fuzz market frame parser
+        run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu market_frame -- -max_total_time=15 -rss_limit_mb=2048
+      - name: Fuzz journal event parser
+        run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu journal_event -- -max_total_time=15 -rss_limit_mb=2048
+      - name: Fuzz IOL order and WebSocket parsers
+        run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu iol_protocol -- -max_total_time=15 -rss_limit_mb=2048
+
+  coverage:
+    name: coverage-baseline
+    runs-on: ubuntu-latest
+    env:
+      CARGO_LLVM_COV_TARGET_DIR: target/llvm-cov-stable
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: llvm-tools-preview
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Generate coverage report and enforce global baseline
+        run: cargo llvm-cov --all-targets --all-features --locked --json --summary-only --fail-under-lines 80 --output-path coverage.json
+      - name: Enforce critical-module baselines
+        run: python3 scripts/check_coverage.py coverage.json
+      - name: Archive coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-coverage-${{ github.sha }}
+          path: coverage.json
+          if-no-files-found: error
+          retention-days: 30
+
+  readiness-branch-coverage:
+    name: readiness-branch-coverage
+    runs-on: ubuntu-latest
+    env:
+      CARGO_LLVM_COV_TARGET_DIR: target/llvm-cov-branch
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install nightly Rust with coverage tools
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: llvm-tools-preview
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Generate branch-instrumented evidence
+        run: >-
+          cargo +nightly llvm-cov
+          --branch
+          --all-targets
+          --all-features
+          --locked
+          --json
+          --output-path readiness-coverage-raw.json
+      - name: Normalize readiness coverage scopes
+        run: |
+          build_hash="$(cargo +nightly run --quiet --locked -- --print-build-hash)"
+          python3 scripts/normalize_readiness_coverage.py readiness-coverage-raw.json "$build_hash" readiness-coverage.json
+      - name: Archive readiness coverage evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: readiness-coverage-${{ github.sha }}
+          path: |
+            readiness-coverage-raw.json
+            readiness-coverage.json
+          if-no-files-found: error
+          retention-days: 90
+
+  dependency-review:
+    name: dependency-review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Review dependency changes
+        uses: actions/dependency-review-action@v4
+
+  audit:
+    name: rustsec-audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Audit Cargo.lock
+        uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  dependency-policy:
+    name: dependency-license-source-policy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Check dependency licenses, bans and sources
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check bans licenses sources
+          rust-version: 1.98.0
+
+  secret-scan:
+    name: verified-and-unknown-secret-scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout complete history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Scan committed history and current change
+        uses: trufflesecurity/trufflehog@20652fbbdefffcdaa493a5bf57ab2ac6b1db715b
+        with:
+          version: 3.97.1
+          extra_args: --results=verified,unknown
+
+  sbom:
+    name: cyclonedx-sbom
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.98.0
+      - name: Install pinned CycloneDX generator
+        run: cargo install cargo-cyclonedx --version 0.5.9 --locked
+      - name: Fix reproducible timestamp to the audited commit
+        run: echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)" >> "$GITHUB_ENV"
+      - name: Generate reproducible CycloneDX 1.5 SBOM
+        run: cargo cyclonedx --all-features --target all --format json --spec-version 1.5 --override-filename options-trading.cdx
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: options-trading-cyclonedx-${{ github.sha }}
+          path: options-trading.cdx.json
+          if-no-files-found: error
+          retention-days: 90

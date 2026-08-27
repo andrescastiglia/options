@@ -3,6 +3,7 @@ name = "options-trading"
 version = "0.1.0"
 edition = "2021"
 description = "Motor de replay, paper y trading gated de opciones para IOL"
+publish = false
 
 [dependencies]
 crossterm = "0.29"
@@ -11,7 +12,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 dotenvy = "0.15"
-reqwest = { version = "0.13.4", default-features = false, features = ["form", "json", "rustls"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["form", "json", "rustls", "stream"] }
 ratatui = "0.30.2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
@@ -20,5 +21,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 zeroize = "1"
 base64 = "0.23.1"
 ring = "0.17"
+rpassword = "7"
+fs2 = "0.4"
+libc = "0.2"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+chrono-tz = "0.10"
 
 [dev-dependencies]
+proptest = "1"
+tempfile = "3"

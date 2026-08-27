@@ -1,0 +1,1 @@
+{"underlying":{"ticker":"GGAL","last":100.0,"bid":99.9,"ask":100.1,"timestamp_secs":1700000000},"options":[{"symbol":"GGALC100","underlying":"GGAL","kind":"Call","strike":100.0,"expiry_days":30,"last":2.0,"bid":1.99,"ask":2.01,"volume":1000,"timestamp_secs":1700000000}]}

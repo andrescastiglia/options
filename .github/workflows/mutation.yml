@@ -1,0 +1,114 @@
+name: Mutation testing
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 6 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  mutation-domains:
+    name: mutants (${{ matrix.domain }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - domain: order-runtime
+            files: >-
+              -f src/app.rs
+              -f src/broker.rs
+              -f src/iol_client.rs
+              -f src/main.rs
+          - domain: durable-risk-secrets
+            files: >-
+              -f src/persistence.rs
+              -f src/risk.rs
+              -f src/secrets.rs
+              -f src/datasets.rs
+              -f src/release_readiness.rs
+          - domain: market-time-config
+            files: >-
+              -f src/config.rs
+              -f src/market.rs
+              -f src/market_calendar.rs
+              -f src/time_reference.rs
+              -f src/vix.rs
+          - domain: research-models
+            files: >-
+              -f src/analytics.rs
+              -f src/experiments.rs
+              -f src/iv_rank.rs
+              -f src/learning.rs
+              -f src/learning_model.rs
+              -f src/multileg.rs
+              -f src/option_analytics.rs
+              -f src/pattern.rs
+              -f src/portfolio.rs
+              -f src/trading.rs
+          - domain: support-ui-storage
+            files: >-
+              -f src/build_identity.rs
+              -f src/errors.rs
+              -f src/lib.rs
+              -f src/number_format.rs
+              -f src/redaction.rs
+              -f src/secure_fs.rs
+              -f src/storage.rs
+              -f src/time_utils.rs
+              -f src/tui.rs
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.98.0
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Install cargo-mutants
+        run: cargo install --locked cargo-mutants --version 27.1.0
+      - name: Require tests to catch critical mutants
+        env:
+          MUTANT_FILES: ${{ matrix.files }}
+        run: |
+          # El valor proviene sólo de la matriz versionada de este workflow.
+          read -r -a selected_files <<< "$MUTANT_FILES"
+          cargo mutants "${selected_files[@]}" --timeout 180 -- --all-targets --all-features --locked
+      - name: Archive mutation report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: critical-mutation-report-${{ matrix.domain }}
+          path: mutants.out/
+          if-no-files-found: warn
+
+  normalize-score:
+    name: normalize mutation score
+    if: always()
+    needs: mutation-domains
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.98.0
+      - name: Download domain reports
+        uses: actions/download-artifact@v4
+        with:
+          pattern: critical-mutation-report-*
+          path: mutation-artifacts
+      - name: Normalize measured scores
+        run: |
+          build_hash="$(cargo run --quiet --locked -- --print-build-hash)"
+          mapfile -t reports < <(find mutation-artifacts -mindepth 1 -maxdepth 1 -type d -name 'critical-mutation-report-*' -print | sort)
+          test "${#reports[@]}" -eq 5
+          python3 scripts/normalize_readiness_mutation.py "$build_hash" readiness-mutation.json "${reports[@]}"
+      - name: Archive normalized mutation evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: readiness-mutation-${{ github.sha }}
+          path: readiness-mutation.json
+          if-no-files-found: error
+          retention-days: 90

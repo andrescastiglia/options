@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{market::OptionKind, pattern::Direction};
+use crate::{
+    market::{ContractMetadataSource, OptionKind},
+    pattern::Direction,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PositionKind {
@@ -46,10 +49,60 @@ pub struct EntryContext {
     pub spread_percentage: Option<f64>,
     pub option_volume: u64,
     pub days_to_expiry: u32,
+    #[serde(default)]
+    pub contract_metadata_observed_at_secs: Option<i64>,
+    #[serde(default)]
+    pub contract_metadata_source: ContractMetadataSource,
+    #[serde(default)]
+    pub contract_metadata_catalog_schema_version: u32,
+    #[serde(default)]
+    pub contract_metadata_catalog_sha256: Option<[u8; 32]>,
+    #[serde(default)]
+    pub contract_metadata_catalog_archived: bool,
     pub moneyness_distance_percentage: f64,
     pub trend_confidence: f64,
     pub trend_r_squared: Option<f64>,
     pub trend_slope_percent_per_minute: f64,
+    #[serde(default)]
+    pub vix_level: Option<f64>,
+    #[serde(default)]
+    pub vix_change_percentage: Option<f64>,
+    #[serde(default)]
+    pub lunch_slowdown: bool,
+    #[serde(default)]
+    pub lunch_quote_updates: Option<u64>,
+    #[serde(default)]
+    pub intrinsic_value: Option<f64>,
+    #[serde(default)]
+    pub extrinsic_value: Option<f64>,
+    #[serde(default)]
+    pub implied_volatility: Option<f64>,
+    #[serde(default)]
+    pub iv_rank: Option<f64>,
+    #[serde(default)]
+    pub iv_rank_window_sessions: Option<usize>,
+    #[serde(default)]
+    pub iv_rank_observations: Option<usize>,
+    #[serde(default)]
+    pub iv_rank_missing_reason: Option<IvRankMissingReason>,
+    #[serde(default)]
+    pub delta: Option<f64>,
+    #[serde(default)]
+    pub gamma: Option<f64>,
+    #[serde(default)]
+    pub theta_per_day: Option<f64>,
+    #[serde(default)]
+    pub vega_per_point: Option<f64>,
+    #[serde(default)]
+    pub rho_per_point: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IvRankMissingReason {
+    AnalyticsDisabled,
+    ImpliedVolatilityUnavailable,
+    InsufficientHistory,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -260,6 +313,8 @@ pub enum ExitReason {
     TrendReversal,
     Timeout,
     RiskLimit,
+    WeekendRisk,
+    ExpiryRisk,
     Manual,
     Defensive,
 }
@@ -397,6 +452,7 @@ impl Default for TradingEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn position(opened_at_secs: i64) -> Position {
         Position {
@@ -491,5 +547,50 @@ mod tests {
             engine.should_exit(1.9, pnl, false, 121, 60, 5_000.0, 50.0),
             Some(ExitReason::Timeout)
         );
+    }
+
+    proptest! {
+        #[test]
+        fn pnl_matches_the_independent_cashflow_identity(
+            entry in 0.01_f64..10_000.0,
+            exit in 0.01_f64..10_000.0,
+            contracts in 1_u32..1_000,
+            contract_multiplier in 1_u32..1_000,
+            cost_percentage in 0.0_f64..5.0,
+            tax_percentage in 0.0_f64..100.0,
+            profit_multiplier in 1.0_f64..10.0,
+        ) {
+            let actual = calculate_pnl_with_contract_multiplier(
+                entry,
+                exit,
+                contracts,
+                contract_multiplier,
+                cost_percentage,
+                tax_percentage,
+                profit_multiplier,
+            );
+            let units = f64::from(contracts) * f64::from(contract_multiplier);
+            let gross = (exit - entry) * units;
+            let entry_cost = entry * units * cost_percentage / 100.0;
+            let exit_cost = exit * units * cost_percentage / 100.0;
+            let tax = gross.max(0.0) * tax_percentage / 100.0;
+            let expected_net = gross - entry_cost - exit_cost - tax;
+            let tolerance = 1e-9 * expected_net.abs().max(1.0);
+
+            prop_assert!((actual.gross - gross).abs() <= tolerance);
+            prop_assert!((actual.entry_cost - entry_cost).abs() <= tolerance);
+            prop_assert!((actual.exit_cost - exit_cost).abs() <= tolerance);
+            prop_assert!((actual.tax - tax).abs() <= tolerance);
+            prop_assert!((actual.net - expected_net).abs() <= tolerance);
+            prop_assert!((actual.threshold - (entry_cost + exit_cost) * profit_multiplier).abs() <= tolerance);
+        }
+
+        #[test]
+        fn position_direction_always_accompanies_its_option_kind(is_call in any::<bool>()) {
+            let mut position = position(1);
+            position.kind = if is_call { PositionKind::Call } else { PositionKind::Put };
+            let expected = if is_call { Direction::Up } else { Direction::Down };
+            prop_assert_eq!(position.direction(), expected);
+        }
     }
 }

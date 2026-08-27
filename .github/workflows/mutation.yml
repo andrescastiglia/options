@@ -95,7 +95,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@1.98.0
       - name: Download domain reports
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: critical-mutation-report-*
           path: mutation-artifacts

@@ -10,17 +10,20 @@ use crossterm::{
 };
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Direction as LayoutDirection, Layout},
+    layout::{Alignment, Constraint, Direction as LayoutDirection, Layout, Rect},
     style::{Color, Modifier, Style},
     symbols,
     text::{Line, Span},
-    widgets::{Axis, Block, Borders, Chart, Dataset, Gauge, GraphType, Paragraph, Sparkline, Wrap},
+    widgets::{
+        Axis, Block, Borders, Chart, Clear, Dataset, Gauge, GraphType, Paragraph, Sparkline, Wrap,
+    },
     Frame, Terminal,
 };
 
 use crate::{
     app::TradingApp,
     errors::AppError,
+    iol_client::WebsocketConnectionState,
     number_format::{decimal, integer},
     pattern::Direction,
     trading::TradingState,
@@ -56,12 +59,21 @@ pub async fn run(app: &mut TradingApp) -> Result<(), AppError> {
     terminal.clear()?;
     let tick_duration = Duration::from_secs(app.config.check_interval_secs);
     let mut next_tick = tokio::time::Instant::now();
+    let mut connection_failure_is_terminal = false;
 
     loop {
         terminal.draw(|frame| draw(frame, app))?;
         if event::poll(Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
+                    if connection_failure_is_terminal {
+                        match key.code {
+                            KeyCode::Char('q') | KeyCode::Esc => break,
+                            KeyCode::Char('s') => app.snapshot()?,
+                            _ => {}
+                        }
+                        continue;
+                    }
                     match key.code {
                         KeyCode::Char('q') | KeyCode::Esc => break,
                         KeyCode::Char(' ') | KeyCode::Char('p') => app.toggle_pause(),
@@ -79,8 +91,39 @@ pub async fn run(app: &mut TradingApp) -> Result<(), AppError> {
                 }
             }
         }
-        if tokio::time::Instant::now() >= next_tick {
-            let running = app.step().await?;
+        if !connection_failure_is_terminal && tokio::time::Instant::now() >= next_tick {
+            let running = match app.step().await {
+                Ok(running) => running,
+                Err(mut last_error @ AppError::Connection(_)) => {
+                    let attempts = app.config.connection_retry_attempts;
+                    let delay = Duration::from_secs(app.config.connection_retry_delay_secs);
+                    let mut recovered = None;
+                    for attempt in 1..=attempts {
+                        app.mark_connection_retry(attempt, attempts, &last_error);
+                        terminal.draw(|frame| draw(frame, app))?;
+                        tokio::time::sleep(delay).await;
+                        match app.step().await {
+                            Ok(running) => {
+                                app.mark_connection_restored();
+                                recovered = Some(running);
+                                break;
+                            }
+                            Err(error @ AppError::Connection(_)) => last_error = error,
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    match recovered {
+                        Some(running) => running,
+                        None => {
+                            app.mark_connection_not_operational(attempts, &last_error)?;
+                            connection_failure_is_terminal = true;
+                            terminal.draw(|frame| draw(frame, app))?;
+                            true
+                        }
+                    }
+                }
+                Err(error) => return Err(error),
+            };
             next_tick = tokio::time::Instant::now() + tick_duration;
             if !running && app.engine.position.is_none() {
                 terminal.draw(|frame| draw(frame, app))?;
@@ -93,6 +136,7 @@ pub async fn run(app: &mut TradingApp) -> Result<(), AppError> {
 
 fn draw(frame: &mut Frame, app: &TradingApp) {
     let area = frame.area();
+    let operational_status = crate::redaction::sanitize_operational_message(&app.status);
     let visual_height = if area.height >= 38 { 14 } else { 10 };
     let rows = Layout::default()
         .direction(LayoutDirection::Vertical)
@@ -125,12 +169,17 @@ fn draw(frame: &mut Frame, app: &TradingApp) {
         |profile| {
             format!(
                 "Cuenta {} · {}",
-                profile.account_number,
-                profile.full_name()
+                profile.masked_account_number(),
+                profile.redacted_name()
             )
         },
     );
-    let connection = simple_connection_status(&app.realtime_status);
+    let iol_status = if app.connection_operational {
+        "IOL: ONLINE"
+    } else {
+        "IOL: OFFLINE"
+    };
+    let websocket = websocket_status(app.websocket_status);
     let header = Paragraph::new(vec![
         Line::from(vec![
             Span::styled(
@@ -147,7 +196,11 @@ fn draw(frame: &mut Frame, app: &TradingApp) {
                 integer(app.ticks)
             )),
             Span::styled(
-                if app.paused { "PAUSADO" } else { &app.status },
+                if app.paused {
+                    "PAUSADO"
+                } else {
+                    &operational_status
+                },
                 Style::default()
                     .fg(if app.paused { Color::Yellow } else { DEEP_GRAY })
                     .add_modifier(Modifier::BOLD),
@@ -156,8 +209,31 @@ fn draw(frame: &mut Frame, app: &TradingApp) {
         Line::from(vec![
             Span::raw(format!(" {account} · ")),
             Span::styled(
-                connection.clone(),
-                Style::default().fg(connection_color(&connection)),
+                iol_status,
+                Style::default().fg(if app.connection_operational {
+                    Color::Green
+                } else {
+                    Color::Red
+                }),
+            ),
+            Span::raw(" · "),
+            Span::styled(
+                websocket,
+                Style::default().fg(websocket_color(app.websocket_status)),
+            ),
+            Span::raw(" · "),
+            Span::styled(
+                app.market_status.clone(),
+                Style::default()
+                    .fg(if app.market_force_pre_break_exit {
+                        Color::Red
+                    } else if !app.market_open || !app.market_entries_allowed || app.lunch_slowdown
+                    {
+                        Color::Yellow
+                    } else {
+                        Color::Green
+                    })
+                    .add_modifier(Modifier::BOLD),
             ),
         ]),
     ])
@@ -208,7 +284,7 @@ fn draw(frame: &mut Frame, app: &TradingApp) {
                 ),
                 Span::raw(" · "),
                 Span::styled(
-                    entry.message.clone(),
+                    formatted_log_message(&entry.message, entry.repetitions),
                     Style::default().fg(log_color(&entry.message)),
                 ),
             ])
@@ -248,6 +324,94 @@ fn draw(frame: &mut Frame, app: &TradingApp) {
         ]))
         .style(Style::default().fg(MUTED_GRAY)),
         rows[4],
+    );
+    if !app.connection_operational {
+        render_not_operational(frame, area, &operational_status);
+    } else if !app.market_open {
+        render_market_offline(frame, area, &app.market_status, &app.market_status_detail);
+    }
+}
+
+fn formatted_log_message(message: &str, repetitions: u64) -> String {
+    if repetitions > 1 {
+        format!("{message} ({repetitions})")
+    } else {
+        message.to_string()
+    }
+}
+
+fn render_market_offline(frame: &mut Frame, area: Rect, headline: &str, detail: &str) {
+    let vertical = Layout::vertical([
+        Constraint::Percentage(35),
+        Constraint::Length(7),
+        Constraint::Percentage(35),
+    ])
+    .split(area);
+    let popup = Layout::horizontal([
+        Constraint::Percentage(15),
+        Constraint::Percentage(70),
+        Constraint::Percentage(15),
+    ])
+    .split(vertical[1])[1];
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                headline,
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(detail),
+            Line::from("No se solicitan cotizaciones ni se abren operaciones."),
+        ])
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: true })
+        .block(
+            Block::default()
+                .title(" OFFLINE ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow)),
+        ),
+        popup,
+    );
+}
+
+fn render_not_operational(frame: &mut Frame, area: Rect, detail: &str) {
+    let vertical = Layout::vertical([
+        Constraint::Percentage(30),
+        Constraint::Length(9),
+        Constraint::Percentage(30),
+    ])
+    .split(area);
+    let popup = Layout::horizontal([
+        Constraint::Percentage(10),
+        Constraint::Percentage(80),
+        Constraint::Percentage(10),
+    ])
+    .split(vertical[1])[1];
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                "NO OPERATIVO · SIN CONEXIÓN CON IOL",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(detail),
+            Line::from(""),
+            Line::from("No se procesan precios ni órdenes. Presione q para salir."),
+        ])
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: true })
+        .block(
+            Block::default()
+                .title(" ALERTA CRÍTICA ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Red)),
+        ),
+        popup,
     );
 }
 
@@ -361,11 +525,25 @@ fn render_market_chart(frame: &mut Frame, app: &TradingApp, area: ratatui::layou
 }
 
 fn market_panel(app: &TradingApp) -> Paragraph<'static> {
+    let title = app.current_vix_display().map_or_else(
+        || Line::from(" ◇ Mercado · VIX NO DISPONIBLE "),
+        |(vix, state)| vix_title(app, vix, state),
+    );
     let lines = if let Some(frame) = &app.current_frame {
         let selected = app
             .selected_option
             .as_deref()
             .and_then(|symbol| frame.option(symbol));
+        let option_count = frame.option_chain_quality.as_ref().map_or_else(
+            || format!("{} opciones", integer(frame.options.len())),
+            |quality| {
+                format!(
+                    "{}/{} opciones válidas",
+                    integer(quality.accepted_contracts),
+                    integer(quality.catalog_contracts)
+                )
+            },
+        );
         vec![
             Line::from(vec![
                 Span::styled(
@@ -385,10 +563,10 @@ fn market_panel(app: &TradingApp) -> Paragraph<'static> {
                 )),
             ]),
             Line::from(format!(
-                "◇ {} · {} · {} opciones · {}",
+                "◇ {} · {} · {} · {}",
                 selected.map_or("sin opción", |option| option.symbol.as_str()),
                 selected.map_or("—", |option| option_kind_name(option.kind)),
-                integer(frame.options.len()),
+                option_count,
                 quote_age(frame.underlying.timestamp_secs)
             )),
             Line::from(vec![
@@ -414,11 +592,67 @@ fn market_panel(app: &TradingApp) -> Paragraph<'static> {
     } else {
         vec![Line::from("Esperando datos de mercado…")]
     };
-    Paragraph::new(lines).block(
-        Block::default()
-            .title(" ◇ Mercado y opción ")
-            .borders(Borders::ALL),
-    )
+    Paragraph::new(lines).block(Block::default().title(title).borders(Borders::ALL))
+}
+
+fn vix_title(
+    app: &TradingApp,
+    vix: crate::market::VixObservation,
+    freshness: crate::market::VixFreshnessState,
+) -> Line<'static> {
+    if freshness == crate::market::VixFreshnessState::Stale {
+        return Line::from(vec![
+            Span::raw(" ◇ Mercado · VIX "),
+            Span::styled(
+                "DESACTUALIZADO",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+        ]);
+    }
+    if freshness == crate::market::VixFreshnessState::PreviousClose {
+        return Line::from(vec![
+            Span::raw(" ◇ Mercado · VIX "),
+            Span::styled(decimal(vix.level, 2), Style::default().fg(Color::Yellow)),
+            Span::raw(" · "),
+            Span::styled(
+                "CIERRE PREVIO",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+        ]);
+    }
+    let change = vix.change_percentage();
+    let (regime, color) =
+        if change.is_some_and(|value| value >= app.config.vix_spike_change_percentage) {
+            ("SALTO", Color::Red)
+        } else if vix.level >= app.config.vix_elevated_level {
+            ("ELEVADO", Color::Yellow)
+        } else {
+            ("NORMAL", Color::Green)
+        };
+    let change = change.map_or_else(
+        || "".into(),
+        |value| format!(" {}%", signed_decimal(value, 2)),
+    );
+    Line::from(vec![
+        Span::raw(" ◇ Mercado · VIX "),
+        Span::styled(
+            decimal(vix.level, 2),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(change, Style::default().fg(color)),
+        Span::raw(" · "),
+        Span::styled("VIGENTE", Style::default().fg(color)),
+        Span::raw(" · "),
+        Span::styled(
+            regime,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+    ])
 }
 
 fn trend_panel(app: &TradingApp) -> Paragraph<'static> {
@@ -625,9 +859,25 @@ fn render_risk_panel(frame: &mut Frame, app: &TradingApp, area: ratatui::layout:
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(format!(
-                " · compra máx. {}",
-                decimal(app.risk.limits.max_notional, 0)
+                " · compra máx. {} · disco {:.0}% · libres {}",
+                decimal(app.risk.limits.max_notional, 0),
+                app.storage_capacity
+                    .quota_usage_ratio(app.config.data_dir_max_bytes)
+                    * 100.0,
+                human_bytes(app.storage_capacity.available_bytes)
             )),
+            Span::styled(
+                if app.clock_synchronized {
+                    " · reloj OK"
+                } else {
+                    " · reloj NO VERIFICADO"
+                },
+                Style::default().fg(if app.clock_synchronized {
+                    Color::Green
+                } else {
+                    Color::Red
+                }),
+            ),
         ])),
         sections[0],
     );
@@ -673,6 +923,16 @@ fn render_risk_panel(frame: &mut Frame, app: &TradingApp, area: ratatui::layout:
             .gauge_style(gauge_style(risk_color(trade_ratio, false))),
         sections[2],
     );
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    if bytes as f64 >= GIB {
+        format!("{:.1} GiB", bytes as f64 / GIB)
+    } else {
+        format!("{:.0} MiB", bytes as f64 / MIB)
+    }
 }
 
 fn render_equity_curve(frame: &mut Frame, app: &TradingApp, area: ratatui::layout::Rect) {
@@ -805,20 +1065,24 @@ fn spread_color(spread: Option<f64>, limit: f64) -> Color {
     }
 }
 
-fn connection_color(status: &str) -> Color {
-    let status = status.to_lowercase();
-    if status.contains("error")
-        || status.contains("rechaz")
-        || status.contains("desconect")
-        || status.contains("fall")
-    {
-        Color::Red
-    } else if status.contains("esperando") || status.contains("conectando") {
-        Color::Yellow
-    } else if status.contains("no necesita") {
-        Color::Cyan
-    } else {
-        Color::Green
+fn websocket_status(status: WebsocketConnectionState) -> &'static str {
+    match status {
+        WebsocketConnectionState::Disabled => "WS: DESACTIVADO",
+        WebsocketConnectionState::Connecting => "WS: CONECTANDO",
+        WebsocketConnectionState::Connected => "WS: CONECTADO",
+        WebsocketConnectionState::Reconnecting => "WS: RECONECTANDO",
+        WebsocketConnectionState::Offline => "WS: OFFLINE",
+    }
+}
+
+fn websocket_color(status: WebsocketConnectionState) -> Color {
+    match status {
+        WebsocketConnectionState::Connected => Color::Green,
+        WebsocketConnectionState::Connecting | WebsocketConnectionState::Reconnecting => {
+            Color::Yellow
+        }
+        WebsocketConnectionState::Disabled => Color::DarkGray,
+        WebsocketConnectionState::Offline => Color::Red,
     }
 }
 
@@ -924,6 +1188,8 @@ fn exit_reason_name(reason: crate::trading::ExitReason) -> &'static str {
         crate::trading::ExitReason::TrendReversal => "el precio cambió de dirección",
         crate::trading::ExitReason::Timeout => "se cumplió el tiempo máximo",
         crate::trading::ExitReason::RiskLimit => "se alcanzó un límite de seguridad",
+        crate::trading::ExitReason::WeekendRisk => "cierre previo a una pausa prolongada",
+        crate::trading::ExitReason::ExpiryRisk => "cierre previo al límite de vencimiento",
         crate::trading::ExitReason::Manual => "venta pedida por la persona",
         crate::trading::ExitReason::Defensive => "venta preventiva por un dato dudoso",
     }
@@ -939,13 +1205,6 @@ fn confidence_name(value: f64) -> &'static str {
     }
 }
 
-fn simple_connection_status(status: &str) -> String {
-    status
-        .replace("WebSocket", "Conexión con IOL")
-        .replace("websocket", "conexión con IOL")
-        .replace("WS", "IOL")
-}
-
 fn quote_age(timestamp_secs: i64) -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -959,22 +1218,29 @@ fn quote_age(timestamp_secs: i64) -> String {
 }
 
 fn argentina_time(timestamp_secs: i64) -> String {
-    const ARGENTINA_UTC_OFFSET_SECS: i64 = -3 * 60 * 60;
-    let seconds_today = (timestamp_secs + ARGENTINA_UTC_OFFSET_SECS).rem_euclid(24 * 60 * 60);
-    let hours = seconds_today / (60 * 60);
-    let minutes = (seconds_today % (60 * 60)) / 60;
-    let seconds = seconds_today % 60;
+    let (hours, minutes, seconds) = crate::time_utils::argentina_hms(timestamp_secs);
     format!("{hours:02}:{minutes:02}:{seconds:02}")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{argentina_time, chart_bounds, risk_color, signed_decimal, sparkline_values};
-    use ratatui::style::Color;
+    use super::{
+        argentina_time, chart_bounds, draw, formatted_log_message, render_market_offline,
+        render_not_operational, risk_color, signed_decimal, sparkline_values, websocket_status,
+    };
+    use crate::app::TradingApp;
+    use crate::iol_client::WebsocketConnectionState;
+    use ratatui::{backend::TestBackend, style::Color, Terminal};
 
     #[test]
     fn formats_explicit_positive_sign() {
         assert_eq!(signed_decimal(1_234.5, 2), "+1.234,50");
+    }
+
+    #[test]
+    fn repeated_log_message_has_a_compact_counter() {
+        assert_eq!(formatted_log_message("Sin cambios", 1), "Sin cambios");
+        assert_eq!(formatted_log_message("Sin cambios", 7), "Sin cambios (7)");
     }
 
     #[test]
@@ -1001,5 +1267,113 @@ mod tests {
         assert_eq!(risk_color(0.6, false), Color::Yellow);
         assert_eq!(risk_color(0.8, false), Color::Red);
         assert_eq!(risk_color(0.0, true), Color::Red);
+    }
+
+    #[test]
+    fn websocket_header_uses_short_operational_labels() {
+        assert_eq!(
+            websocket_status(WebsocketConnectionState::Disabled),
+            "WS: DESACTIVADO"
+        );
+        assert_eq!(
+            websocket_status(WebsocketConnectionState::Connected),
+            "WS: CONECTADO"
+        );
+        assert_eq!(
+            websocket_status(WebsocketConnectionState::Reconnecting),
+            "WS: RECONECTANDO"
+        );
+        assert_eq!(
+            websocket_status(WebsocketConnectionState::Offline),
+            "WS: OFFLINE"
+        );
+    }
+
+    #[test]
+    fn closed_market_popup_says_offline_and_explains_the_reason() {
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_market_offline(
+                    frame,
+                    frame.area(),
+                    "OFFLINE · MERCADO CERRADO",
+                    "Feriado: Día de la Independencia",
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let rendered = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("OFFLINE · MERCADO CERRADO"));
+        assert!(rendered.contains("Feriado: Día de la Independencia"));
+        assert!(rendered.contains("No se solicitan cotizaciones"));
+    }
+
+    #[test]
+    fn connection_failure_popup_is_short_and_explicit() {
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_not_operational(frame, frame.area(), "Timeout consultando IOL");
+            })
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("NO OPERATIVO · SIN CONEXIÓN CON IOL"));
+        assert!(rendered.contains("Timeout consultando IOL"));
+        assert!(rendered.contains("No se procesan precios ni órdenes"));
+    }
+
+    #[test]
+    fn complete_dashboard_renders_operational_state_on_wide_and_compact_terminals() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "options-tui-render-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut config = crate::config::tests::config();
+        config.data_dir = data_dir.clone();
+        config.capture_market_data = false;
+        let mut app = TradingApp::new_for_test(config).unwrap();
+        app.connection_operational = true;
+        app.market_open = true;
+        app.market_entries_allowed = true;
+        app.market_status = "ONLINE · MERCADO ABIERTO".into();
+        app.status = "Observando".into();
+
+        for (width, height) in [(120, 42), (80, 30)] {
+            let backend = TestBackend::new(width, height);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|frame| draw(frame, &app)).unwrap();
+            let rendered = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(rendered.contains("OPCIONES / IOL"));
+            assert!(rendered.contains("IOL: ONLINE"));
+            if width >= 100 {
+                assert!(rendered.contains("MERCADO ABIERTO"));
+            }
+            assert!(rendered.contains("Lo que fue pasando"));
+        }
+        drop(app);
+        std::fs::remove_dir_all(data_dir).unwrap();
     }
 }

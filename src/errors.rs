@@ -16,4 +16,6 @@ pub enum AppError {
     Recovery(String),
     #[error("integracion externa fallida: {0}")]
     External(String),
+    #[error("conexión con IOL fallida: {0}")]
+    Connection(String),
 }

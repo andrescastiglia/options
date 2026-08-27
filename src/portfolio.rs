@@ -85,6 +85,10 @@ impl Portfolio {
         self.positions.contains_key(id)
     }
 
+    pub fn position(&self, id: &str) -> Option<&Position> {
+        self.positions.get(id)
+    }
+
     pub fn closed_trades(&self) -> &[ClosedTrade] {
         &self.closed
     }

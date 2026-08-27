@@ -1,3 +1,39 @@
+# Rust y herramientas de análisis
 /target/
+/fuzz/target/
+/mutants.out*/
+*.profraw
+/coverage.json
+/lcov.info
+/htmlcov/
+/mutation-artifacts/
+
+# Estado, evidencia y capturas locales de la aplicación
 /data/
+/readiness-input.json
+/readiness-coverage*.json
+/readiness-mutation*.json
+/fuzz-evidence.tar.zst
+
+# Configuración local y material criptográfico
 .env
+.env.*
+!.env.example
+.envrc
+.direnv/
+*.key
+*.pem
+*.p12
+*.pfx
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+
+# Sistema operativo y editores
+.DS_Store
+.idea/
+*.swp
+*.swo

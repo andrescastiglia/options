@@ -160,7 +160,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
       - name: Review dependency changes
-        uses: actions/dependency-review-action@v4
+        uses: actions/dependency-review-action@v5
 
   audit:
     name: rustsec-audit

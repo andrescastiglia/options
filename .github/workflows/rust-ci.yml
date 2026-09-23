@@ -197,7 +197,7 @@ jobs:
         with:
           fetch-depth: 0
       - name: Scan committed history and current change
-        uses: trufflesecurity/trufflehog@20652fbbdefffcdaa493a5bf57ab2ac6b1db715b
+        uses: trufflesecurity/trufflehog@f714bf454f350590f4a24c3ddb1aef02c35bf5b6
         with:
           version: 3.97.1
           extra_args: --results=verified,unknown
